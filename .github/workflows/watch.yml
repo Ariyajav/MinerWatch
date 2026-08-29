@@ -19,6 +19,7 @@ jobs:
       - name: Probe estate endpoints
         env:
           KEYWORD: ${{ secrets.EGROW_KEYWORD }}
+          UA: 'estate-watch/1.0 (+https://github.com/Ariyajav/MinerWatch)'
         run: |
           set -u
           echo "keyword length: ${#KEYWORD}"
@@ -29,8 +30,9 @@ jobs:
 
           FAILED=""
 
-          BODY=$(curl -sL --max-time 20 https://egrow.mn/mn_MN/ || true)
+          BODY=$(curl -sL --max-time 20 -A "$UA" https://egrow.mn/mn_MN/ || true)
           echo "egrow.mn body bytes: ${#BODY}"
+          echo "egrow.mn first 200: $(printf '%s' "$BODY" | head -c 200 | tr -d '\n')"
           if printf '%s' "$BODY" | grep -qF -- "$KEYWORD"; then
             echo "egrow.mn: keyword FOUND"
           else
@@ -38,11 +40,11 @@ jobs:
             FAILED="${FAILED}- egrow.mn: keyword missing or unreachable"$'\n'
           fi
 
-          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 https://drweb.mn/ || echo 000)
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 -A "$UA" https://drweb.mn/ || echo 000)
           echo "drweb.mn: HTTP $CODE"
           [ "$CODE" = "200" ] || FAILED="${FAILED}- drweb.mn: HTTP $CODE"$'\n'
 
-          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 https://rly1.drweb.mn/ || echo 000)
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 -A "$UA" https://rly1.drweb.mn/ || echo 000)
           echo "rly1.drweb.mn: HTTP $CODE"
           [ "$CODE" = "200" ] || FAILED="${FAILED}- rly1.drweb.mn: HTTP $CODE"$'\n'
 
