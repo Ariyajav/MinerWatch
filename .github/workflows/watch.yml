@@ -5,6 +5,13 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: estate-watch
+  cancel-in-progress: false
+
 jobs:
   watch:
     runs-on: ubuntu-latest
@@ -39,11 +46,12 @@ jobs:
           echo "rly1.drweb.mn: HTTP $CODE"
           [ "$CODE" = "200" ] || FAILED="${FAILED}- rly1.drweb.mn: HTTP $CODE"$'\n'
 
-          if timeout 10 bash -c 'cat < /dev/null > /dev/tcp/192.82.76.17/2193' 2>/dev/null; then
-            echo "rly1:2193 OPEN"
+          BANNER=$(timeout 10 bash -c 'exec 3<>/dev/tcp/192.82.76.17/2193; printf "x\n" >&3; head -c 200 <&3' 2>/dev/null || true)
+          if printf '%s' "$BANNER" | grep -q 'PROTOCOL'; then
+            echo "rly1:2193 ESS responding"
           else
-            echo "rly1:2193 UNREACHABLE"
-            FAILED="${FAILED}- rly1:2193 Dr.Web agent port unreachable"$'\n'
+            echo "rly1:2193 NO ESS BANNER"
+            FAILED="${FAILED}- rly1:2193 no ESS protocol banner"$'\n'
           fi
 
           {
@@ -57,15 +65,6 @@ jobs:
           if [ -n "$FAILED" ]; then printf 'FAILURES:\n%s' "$FAILED"; else echo "all checks passed"; fi
           true
 
-      - name: Alert
-        if: always() && env.FAILED != ''
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
-            -d chat_id=${{ secrets.TG_CHAT }} \
-            --data-urlencode "text=estate-watch (external) FAILED:
-          ${{ env.FAILED }}
-          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          exit 1
       - name: Alert
         if: always() && env.FAILED != ''
         env:
