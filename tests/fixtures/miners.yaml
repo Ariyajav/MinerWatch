@@ -1,0 +1,48 @@
+# Fixture configuration for the test suite.
+#
+# The schedule assertions in test_config.py and test_schedule.py are written
+# against this file, so it is part of the tests, not an example to copy. For a
+# starting point for a real fleet, see miners.example.yaml in the repo root.
+#
+#   miner-01  group schedule, weekdays 09:00-17:00
+#   miner-02  own schedule, weekdays 22:00-23:00 (overrides the group)
+#   miner-03  no schedule at all
+
+poll_interval_seconds: 15
+default_timezone: UTC
+db_path: minerwatch.db
+
+sleep:
+  enabled: false
+  dry_run: true
+  backend: cgminer
+  cooldown_seconds: 300
+  grace_seconds: 180
+  max_failures: 3
+
+groups:
+  farm-a:
+    schedule:
+      windows:
+        - days: [mon, tue, wed, thu, fri]
+          ranges: ["09:00-17:00"]
+  solo:
+    schedule: null
+
+miners:
+  - id: miner-01
+    host: 127.0.0.1
+    port: 4101
+    group: farm-a
+  - id: miner-02
+    host: 127.0.0.1
+    port: 4102
+    group: farm-a
+    schedule:
+      windows:
+        - days: [mon, tue, wed, thu, fri]
+          ranges: ["22:00-23:00"]
+  - id: miner-03
+    host: 127.0.0.1
+    port: 4103
+    group: solo

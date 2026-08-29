@@ -1,0 +1,32 @@
+[project]
+name = "minerwatch"
+version = "0.2.0"
+description = "Monitor, schedule, and software-sleep Antminer devices"
+# 3.10 is the real floor: the code uses PEP 604 unions (`X | None`) in runtime
+# annotations, which 3.9 cannot evaluate. Nothing needs 3.12 — that bound was
+# inherited and it silently blocks installation on a 3.10/3.11 host, which is
+# what most Windows machines have. Verified green on 3.10, 3.11, 3.12 and 3.13.
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+    # Windows ships no IANA time zone database, so zoneinfo has nothing to read
+    # and every ZoneInfo() lookup fails. This wheel provides it.
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+minerwatch = "minerwatch.cli:main"
+
+[tool.setuptools]
+packages = ["minerwatch"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

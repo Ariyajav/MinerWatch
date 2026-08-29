@@ -1,0 +1,145 @@
+# MinerWatch example configuration
+# ---------------------------------------------------------------------------
+# Copy this file to miners.yaml and edit it for your own fleet. miners.yaml is
+# gitignored, because it holds your addresses and web-UI credentials.
+#
+#   cp miners.example.yaml miners.yaml
+#   python -m minerwatch -c miners.yaml config     # show what this resolves to
+#   python -m minerwatch -c miners.yaml check      # can we reach each backend?
+#   python -m minerwatch -c miners.yaml run        # supervision loop (rehearsal)
+#
+# Settings merge global -> group -> miner, so a group can set credentials once
+# and a single miner can override only the part it needs.
+
+poll_interval_seconds: 15
+
+# Windows are evaluated in this zone. Set it to the fleet's local zone -- the
+# default is UTC, which silently shifts every window by your UTC offset.
+default_timezone: UTC
+
+# Relative paths are resolved against this file's directory, so the database
+# does not move when the working directory changes (Windows Task Scheduler
+# starts programs in C:\Windows\System32).
+db_path: minerwatch.db
+
+# ---------------------------------------------------------------------------
+# Watchdog: restart miners that fail inside their own working hours
+# ---------------------------------------------------------------------------
+watchdog:
+  enabled: true
+  fail_after_seconds: 1800   # continuous in-window failure before the first restart
+  cooldown_seconds: 900      # between attempts
+  rate_window_seconds: 3600
+  max_restarts: 3            # then latch for a human
+
+  # cooldown_seconds * (max_restarts - 1) must stay below rate_window_seconds,
+  # or the oldest attempt is always evicted before the newest arrives, the
+  # limit is never reached, and a miner that restarting cannot fix is restarted
+  # forever instead of latching. The config refuses such a policy.
+
+# ---------------------------------------------------------------------------
+# Software power control ("sleep")
+# ---------------------------------------------------------------------------
+# Stops a miner without cutting power, so it stays reachable and can be woken
+# again over the network. Applied automatically at the edges of each miner's
+# schedule: slept when its window closes, woken when it opens.
+#
+# Two safety gates, both of which must be open before anything reaches
+# hardware:
+#   enabled: true      - turn the feature on
+#   dry_run: false     - stop rehearsing and actually send commands
+# In dry-run the full state machine still runs and logs would_sleep /
+# would_wake events, so a schedule can be validated against real miners with
+# no risk.
+sleep:
+  enabled: false
+  dry_run: true
+
+  # cgminer       - JSON over the miner's API port. Works on firmwares that
+  #                 expose a real sleep there (Vnish, Braiins OS+); stock
+  #                 Bitmain firmware generally does not.
+  # bitmain_http  - Bitmain stock firmware web UI: sets the power-mode field to
+  #                 1 (sleep) / 0 (normal). Needs the web credentials below.
+  backend: cgminer
+
+  cooldown_seconds: 300   # minimum gap between two power actions on one miner
+  grace_seconds: 180      # spin-up allowance after a wake before alarming
+  max_failures: 3         # consecutive failures before manual attention
+
+  # cgminer backend: each command is tried in order and the first one the
+  # firmware accepts wins, so a mixed fleet can share one setting. Override
+  # only if your firmware names things differently.
+  # sleep_commands: ["ascset:0,sleep", "pause"]
+  # wake_commands:  ["ascset:0,wake",  "resume"]
+  # api_port: 4028      # defaults to the miner's poll port
+
+  # bitmain_http backend. Put real credentials in miners.yaml, never here.
+  # http_scheme: http
+  # http_port: 80
+  # username: CHANGE_ME
+  # password: CHANGE_ME
+  # timeout_seconds: 15
+
+# ---------------------------------------------------------------------------
+# Groups
+# ---------------------------------------------------------------------------
+groups:
+
+  # Runs continuously; monitored and restarted, never slept.
+  #
+  # The full-day window is deliberate. A narrower window on a miner that runs
+  # around the clock has the watchdog treat a genuine failure outside it as
+  # expected_off. Note "00:00-24:00", not "00:00-23:59" -- the latter parses
+  # and silently drops a minute every day.
+  hall-a:
+    schedule:
+      windows:
+        - days: [mon, tue, wed, thu, fri, sat, sun]
+          ranges: ["00:00-24:00"]
+    sleep:
+      enabled: false     # this group is monitor-only
+      dry_run: true      # second gate stays shut, so flipping one line cannot actuate
+
+  # Sleeps outside its window. The range crosses midnight: open at 21:00,
+  # closed at 18:00 the next day. Check it with `config --hours`.
+  hall-b:
+    schedule:
+      windows:
+        - days: [mon, tue, wed, thu, fri, sat, sun]
+          ranges: ["21:00-18:00"]
+    sleep:
+      enabled: true
+      dry_run: true              # set false only after a rehearsal across a real edge
+      backend: bitmain_http
+      cooldown_seconds: 900
+      # A work-mode change reboots the mining process, and a miner can still
+      # read 0 TH/s several minutes after a verified wake. Keep this generous
+      # or the watchdog will restart a miner that is merely spinning up.
+      grace_seconds: 900
+
+  # A group with no schedule: always considered in-window.
+  solo:
+    schedule: null
+
+# ---------------------------------------------------------------------------
+# Miners
+# ---------------------------------------------------------------------------
+# port is the cgminer API port (4028), NOT the web-UI port. Putting 80 here
+# makes every miner time out and read as unreachable; `config` lints for it.
+#
+# Check the group column with `config` before editing groups -- group names and
+# miner-id prefixes are independent, and assuming they match is an easy way to
+# arm the wrong half of a fleet.
+miners:
+  - { id: miner-01, host: 10.0.0.1, port: 4028, group: hall-b }
+  - { id: miner-02, host: 10.0.0.2, port: 4028, group: hall-b }
+  - { id: miner-03, host: 10.0.0.3, port: 4028, group: hall-a }
+  - { id: miner-04, host: 10.0.0.4, port: 4028, group: hall-a }
+
+  # Per-miner overrides win over the group.
+  # - id: miner-05
+  #   host: 10.0.0.5
+  #   port: 4028
+  #   group: hall-a
+  #   sleep:
+  #     enabled: false     # never touch this one

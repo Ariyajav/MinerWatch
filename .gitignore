@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# Virtual environment
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Simulator control files (generated per port at runtime)
+sim/state-*.json
+
+# MinerWatch database
+*.db
+*.db-wal
+*.db-shm
+
+# Local fleet configuration - addresses and web-UI credentials
+/miners.yaml
+/demo.db
+
+# Runtime logs
+logs/
+*.log
+
+# Local patches / scratch
+*.patch

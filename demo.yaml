@@ -1,0 +1,58 @@
+# Hardware-free demo config: point MinerWatch at the bundled simulators and
+# watch a full sleep/wake cycle without touching a real miner.
+#
+#   1. Start the fake miners:   powershell -File scripts\sim.ps1
+#   2. Rehearse:                python -m minerwatch -c demo.yaml run
+#   3. For real (simulators):   python -m minerwatch -c demo.yaml run --live-sleep
+#
+# The two groups below are deliberately time-independent, so the demo behaves
+# the same whenever you run it: "always-open" is inside its window 24/7 and
+# "always-closed" never is.
+
+poll_interval_seconds: 5
+default_timezone: UTC
+db_path: demo.db
+
+sleep:
+  enabled: true
+  dry_run: true          # flip to false, or pass --live-sleep, to actuate
+  backend: cgminer
+  cooldown_seconds: 30
+  grace_seconds: 10
+
+groups:
+  always-open:
+    schedule:
+      windows:
+        - days: [mon, tue, wed, thu, fri, sat, sun]
+          ranges: ["00:00-24:00"]
+  always-closed:
+    schedule:
+      windows:
+        - days: [mon, tue, wed, thu, fri, sat, sun]
+          ranges: ["03:00-03:01"]   # a one-minute window you are almost never in
+
+miners:
+  # Inside its window: left alone, and restarted by the watchdog if it dies.
+  - id: sim-running
+    host: 127.0.0.1
+    port: 4101
+    group: always-open
+
+  # Outside its window: MinerWatch puts this one to sleep.
+  - id: sim-offhours
+    host: 127.0.0.1
+    port: 4102
+    group: always-closed
+
+  # Same, but driven through the Bitmain web UI instead of the cgminer socket.
+  # Needs: powershell -File scripts\sim.ps1 -WithHttp
+  - id: sim-bitmain
+    host: 127.0.0.1
+    port: 4103
+    group: always-closed
+    sleep:
+      backend: bitmain_http
+      http_port: 8080
+      username: root
+      password: root
