@@ -1,0 +1,42 @@
+name: estate-watch
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe estate endpoints
+        env:
+          KEYWORD: ${{ secrets.kkkkdfgdfgfdgfdgdfgfdgfdgkkkkk }}
+        run: |
+          FAILED=""
+
+          curl -sL --max-time 20 https://egrow.mn/mn_MN/ | grep -qF "$KEYWORD" \
+            || FAILED="${FAILED}- egrow.mn: keyword missing or unreachable"$'\n'
+
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 https://drweb.mn/ || echo 000)
+          [ "$CODE" = "200" ] || FAILED="${FAILED}- drweb.mn: HTTP $CODE"$'\n'
+
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 https://rly1.drweb.mn/ || echo 000)
+          [ "$CODE" = "200" ] || FAILED="${FAILED}- rly1.drweb.mn: HTTP $CODE"$'\n'
+
+          timeout 10 bash -c 'cat < /dev/null > /dev/tcp/192.82.76.17/2193' 2>/dev/null \
+            || FAILED="${FAILED}- rly1:2193 Dr.Web agent port unreachable"$'\n'
+
+          { echo "FAILED<<EOF"; printf '%s' "$FAILED"; echo; echo "EOF"; } >> "$GITHUB_ENV"
+          [ -z "$FAILED" ] && echo "all checks passed"
+
+      - name: Alert
+        if: env.FAILED != ''
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT }} \
+            --data-urlencode "text=estate-watch (external): checks failed
+          ${{ env.FAILED }}
+          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          exit 1
+
