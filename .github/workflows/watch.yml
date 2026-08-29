@@ -11,32 +11,58 @@ jobs:
     steps:
       - name: Probe estate endpoints
         env:
-          KEYWORD: ${{ secrets.kkkkdfgdfgfdgfdgdfgfdgfdgkkkkk }}
+          KEYWORD: ${{ secrets.EGROW_KEYWORD }}
         run: |
+          set -u
+          echo "keyword length: ${#KEYWORD}"
+          if [ -z "$KEYWORD" ]; then
+            echo "::error::EGROW_KEYWORD is empty - check would pass vacuously"
+            exit 1
+          fi
+
           FAILED=""
 
-          curl -sL --max-time 20 https://egrow.mn/mn_MN/ | grep -qF "$KEYWORD" \
-            || FAILED="${FAILED}- egrow.mn: keyword missing or unreachable"$'\n'
+          BODY=$(curl -sL --max-time 20 https://egrow.mn/mn_MN/ || true)
+          echo "egrow.mn body bytes: ${#BODY}"
+          if printf '%s' "$BODY" | grep -qF -- "$KEYWORD"; then
+            echo "egrow.mn: keyword FOUND"
+          else
+            echo "egrow.mn: keyword NOT FOUND"
+            FAILED="${FAILED}- egrow.mn: keyword missing or unreachable"$'\n'
+          fi
 
           CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 https://drweb.mn/ || echo 000)
+          echo "drweb.mn: HTTP $CODE"
           [ "$CODE" = "200" ] || FAILED="${FAILED}- drweb.mn: HTTP $CODE"$'\n'
 
           CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 20 https://rly1.drweb.mn/ || echo 000)
+          echo "rly1.drweb.mn: HTTP $CODE"
           [ "$CODE" = "200" ] || FAILED="${FAILED}- rly1.drweb.mn: HTTP $CODE"$'\n'
 
-          timeout 10 bash -c 'cat < /dev/null > /dev/tcp/192.82.76.17/2193' 2>/dev/null \
-            || FAILED="${FAILED}- rly1:2193 Dr.Web agent port unreachable"$'\n'
+          if timeout 10 bash -c 'cat < /dev/null > /dev/tcp/192.82.76.17/2193' 2>/dev/null; then
+            echo "rly1:2193 OPEN"
+          else
+            echo "rly1:2193 UNREACHABLE"
+            FAILED="${FAILED}- rly1:2193 Dr.Web agent port unreachable"$'\n'
+          fi
 
-          { echo "FAILED<<EOF"; printf '%s' "$FAILED"; echo; echo "EOF"; } >> "$GITHUB_ENV"
-          [ -z "$FAILED" ] && echo "all checks passed"
+          {
+            echo "FAILED<<__EOF__"
+            printf '%s' "$FAILED"
+            echo
+            echo "__EOF__"
+          } >> "$GITHUB_ENV"
+
+          echo "---- summary ----"
+          if [ -n "$FAILED" ]; then printf 'FAILURES:\n%s' "$FAILED"; else echo "all checks passed"; fi
+          true
 
       - name: Alert
-        if: env.FAILED != ''
+        if: always() && env.FAILED != ''
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT }} \
-            --data-urlencode "text=estate-watch (external): checks failed
+            --data-urlencode "text=estate-watch (external) FAILED:
           ${{ env.FAILED }}
-          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           exit 1
-
