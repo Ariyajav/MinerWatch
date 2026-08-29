@@ -34,7 +34,6 @@ jobs:
             -H "X-Estate-Watch: ${{ secrets.WATCH_TOKEN }}" \
             https://egrow.mn/mn_MN/ || true)
           echo "egrow.mn body bytes: ${#BODY}"
-          echo "egrow.mn first 200: $(printf '%s' "$BODY" | head -c 200 | tr -d '\n')"
           if printf '%s' "$BODY" | grep -qF -- "$KEYWORD"; then
             echo "egrow.mn: keyword FOUND"
           else
