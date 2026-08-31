@@ -11,6 +11,7 @@ import io
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,13 @@ class TestWriteTextAtomic:
                     # On Windows a concurrent reader can lose the race for the
                     # handle; that is a miss, not a torn read.
                     pass
+                # Model a reader that does something between reads. Without
+                # this the loop reopens the file continuously and holds a
+                # handle for essentially the whole run, which on Windows
+                # starves os.replace of any window to land in - the property
+                # under test is "never a torn read", not "survives a
+                # 100%-duty-cycle handle hog".
+                time.sleep(0.001)
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()
@@ -106,6 +114,41 @@ class TestWriteTextAtomic:
         compat.write_text_atomic(p, "new")
         assert p.read_text(encoding="utf-8") == "new"
         assert calls["n"] == 3
+
+    def test_the_default_budget_survives_a_long_lock(self, tmp_path, monkeypatch):
+        """The old 5-attempt budget lost on a clean Windows CI runner.
+
+        Not a loaded machine: GitHub's windows-latest failed this with
+        `[WinError 5] Access is denied` against a reader thread reopening the
+        file in a tight loop. Windows reports both ERROR_ACCESS_DENIED (5) and
+        ERROR_SHARING_VIOLATION (32) for this, so the retry keys on
+        PermissionError, and the budget has to outlast a holder that refuses
+        for longer than half a second.
+        """
+        p = tmp_path / "state.json"
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def locked_for_a_while(src, dst):
+            calls["n"] += 1
+            if calls["n"] < 9:                      # past the old 5-attempt budget
+                raise PermissionError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(compat.os, "replace", locked_for_a_while)
+        monkeypatch.setattr(compat.time, "sleep", lambda _: None)
+        compat.write_text_atomic(p, "new")
+        assert p.read_text(encoding="utf-8") == "new"
+        assert calls["n"] == 9
+
+    def test_the_backoff_is_capped(self):
+        """Bounded total wait: linear growth without a cap gets silly fast."""
+        waits = [
+            min(compat.REPLACE_BACKOFF_SECONDS * a, compat.REPLACE_BACKOFF_MAX_SECONDS)
+            for a in range(1, compat.REPLACE_ATTEMPTS)
+        ]
+        assert max(waits) == compat.REPLACE_BACKOFF_MAX_SECONDS
+        assert sum(waits) < 5, "a control-file write must not stall the caller for seconds on end"
 
     def test_a_permanently_locked_destination_still_raises(self, tmp_path, monkeypatch):
         p = tmp_path / "state.json"

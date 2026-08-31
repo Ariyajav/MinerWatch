@@ -217,8 +217,16 @@ def read_text(path: str | os.PathLike[str], encoding: str = "utf-8") -> str:
 
 #: How many times to retry the final rename, and how long to wait between
 #: attempts. See :func:`write_text_atomic`.
-REPLACE_ATTEMPTS = 5
+#:
+#: The budget was 5 attempts at a 0.05s linear backoff - about half a second -
+#: and that lost on a clean Windows CI runner, not just a loaded host: a reader
+#: reopening the file in a tight loop keeps a handle on it for most of any
+#: half-second window. Real holders are worse, because a virus scanner can sit
+#: on a file for seconds. The backoff is capped so the total stays bounded at
+#: roughly 2.3s rather than growing without limit.
+REPLACE_ATTEMPTS = 12
 REPLACE_BACKOFF_SECONDS = 0.05
+REPLACE_BACKOFF_MAX_SECONDS = 0.25
 
 
 def write_text_atomic(
@@ -239,8 +247,11 @@ def write_text_atomic(
     CPython opens files without ``FILE_SHARE_DELETE``, so while any other
     process has the destination open — a virus scanner, an Explorer preview, a
     text editor — ``os.replace`` fails with ``PermissionError``
-    (``ERROR_SHARING_VIOLATION``). Those holders are transient, so the rename is
-    retried briefly before giving up rather than failing on the first collision.
+    (``ERROR_SHARING_VIOLATION``) or ``ERROR_ACCESS_DENIED`` - Windows reports
+    both for this, so the retry keys on ``PermissionError`` rather than on a
+    specific ``winerror``. Those holders are transient, so the rename is retried
+    for a couple of seconds before giving up rather than failing on the first
+    collision.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,7 +274,8 @@ def write_text_atomic(
                     attempt,
                     attempts,
                 )
-                time.sleep(REPLACE_BACKOFF_SECONDS * attempt)
+                time.sleep(min(REPLACE_BACKOFF_SECONDS * attempt,
+                               REPLACE_BACKOFF_MAX_SECONDS))
     except BaseException:
         try:
             os.unlink(tmp)
