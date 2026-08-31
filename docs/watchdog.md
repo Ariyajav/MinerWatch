@@ -23,13 +23,43 @@ restart. See [architecture.md](architecture.md#why-the-sleeper-runs-before-the-w
 | 4 | latched for manual attention | `skipped_needs_attention` |
 | 5 | failing for less than `fail_after_seconds` | `waiting_to_restart` |
 | 6 | inside `cooldown_seconds` of the last attempt | `skipped_cooldown` |
-| 7 | `max_restarts` reached inside `rate_window_seconds` | `needs_attention` (latched) |
+| 7 | `max_restarts` reached inside `rate_window_seconds` | `needs_attention` (latched), or `would_need_attention` when rehearsing |
 | 8 | rehearsing | `would_restart` |
 | 9 | — | `restart` / `restart_failed` |
 
 Step 3 sits before step 4 deliberately: with the latch checked first, a latched
 miner wrote `skipped_needs_attention` all night, and that action counts towards
 the failure clock.
+
+## A rehearsal never sets the durable latch
+
+Step 7 splits on dry-run for a reason worth spelling out, because the failure it
+prevents is silent and looks like the watchdog simply not working.
+
+`needs_attention` is hydrated from the events table at startup and survives into
+live mode. When a rehearsal could set it, a rehearsing watchdog switched itself
+off for that miner **permanently**: three `would_restart` rows, then a real
+latch, then `skipped_needs_attention` on every poll from then on. Switching the
+service to a live mode did not help — the newly-live watchdog's first act was to
+read that latch and decline to act on it, so a miner that stopped was never
+restarted and someone had to walk over and do it by hand. Nothing in `status`
+distinguished this from a watchdog that was working and simply had nothing to do,
+apart from the `ATTENTION` column.
+
+So a dry run now records `would_need_attention` and holds an in-process latch
+that is never written as `needs_attention` and never rebuilt at startup. The
+rehearsal still demonstrates the full state machine, including hitting the limit;
+it just cannot leave a belief behind for a live run to act on. `history` shows
+`skipped_would_need_attention` for the polls after it, so the two cases read
+differently in the log.
+
+This is the watchdog's half of a rule the sleeper already followed: rehearsal
+records are not read back as fact.
+
+**If you are moving a fleet from rehearsed to live restarts**, run
+`clear-attention all` first. Latches set by rehearsals under an older build are
+still in the events table, and they will suppress the first real restart on every
+miner that carries one.
 
 ## Configuration
 
@@ -94,6 +124,69 @@ two adversarial review rounds, each with a regression test in
   every twenty minutes would otherwise hand every miner a fresh delay each time
   and silently disable the watchdog exactly when it is needed.
 
+## Choosing a recovery mechanism
+
+`recover_with` decides what an attempt actually does. It exists because the
+default does nothing at all on some firmware.
+
+| Value | What it sends | When to use it |
+| --- | --- | --- |
+| `cgminer` (default) | `{"command":"restart"}` on the API port — restarts the mining process, not the box | Firmware that implements it: Vnish, Braiins OS+, and some Bitmain builds |
+| `bitmain_reboot` | A reboot request to the stock web UI's CGI | Firmware with no cgminer `restart` |
+| `auto` | The restart, escalating to the reboot **only** when the firmware says the command does not exist | A mixed fleet, or when you don't yet know which you have |
+
+**How to tell which you need.** Read a `restart_failed` row in `history`:
+
+| Reply | Means | Mechanism |
+| --- | --- | --- |
+| `Invalid command` | the firmware has no `restart` | `bitmain_reboot` or `auto` |
+| `Access denied` | it has one, but `api-allow` grants this host no `W` | fix `api-allow`, stay on `cgminer` |
+| a timeout | no TCP at all | neither will help — see the limit below |
+
+`auto` escalates on the first of those and **not** on the others. That
+distinction is the whole safety argument for it: an `Access denied` is a
+configuration typo, and escalating past it would reboot a fleet over a missing
+permission.
+
+### What the reboot does and does not guarantee
+
+- **It authenticates before it acts.** A read-only probe runs first, so a wrong
+  password or an unreachable web UI is reported with nothing sent. A reboot
+  cannot be undone by writing the old value back, the way a work-mode write can.
+- **It cannot be verified synchronously.** The box goes down mid-response, so
+  "success" means the firmware accepted the request. The real evidence is the
+  miner disappearing from the next few polls and coming back. A dropped
+  connection during the request counts as sent, not failed.
+- **One attempt is one attempt.** An `auto` escalation that tries both
+  mechanisms still records a single entry in the rate-limit deque, so it cannot
+  halve a miner's retry budget.
+- **It is not a fix for a hardware fault.** A miner that halted on a dead fan or
+  an over-temperature will halt again minutes after coming back, and nothing in
+  the request can tell that case from a wedged process. `max_restarts` is what
+  bounds the loop; the resulting latch is the correct outcome.
+
+Anything other than `cgminer` requires `cooldown_seconds >= 900`, and the config
+refuses a shorter one. A rebooted S19 is unreachable for minutes and then spins
+up for several more; at a restart-sized cooldown the second attempt fires at a
+miner that is already recovering, reads as a failure, and spends the budget.
+
+```yaml
+watchdog:
+  enabled: true
+  fail_after_seconds: 1800
+  cooldown_seconds: 900        # >= 900 whenever recover_with is not cgminer
+  rate_window_seconds: 3600
+  max_restarts: 3
+  recover_with: auto
+  # reboot_path: /cgi-bin/reboot.cgi   # only if your firmware moved it
+```
+
+The HTTP credentials come from the miner's `sleep:` block deliberately — there
+is one web-UI username, password and port per miner, and duplicating them under
+`watchdog:` would create two places to get them wrong. **Sleep does not have to
+be enabled** for the watchdog to use them, so a monitor-only group can still
+reboot.
+
 ## The limit worth knowing
 
 The restart is `{"command":"restart"}` over the cgminer TCP API — it restarts
@@ -131,6 +224,10 @@ The operational lessons:
 - **This is the argument for leaving restarts rehearsed.** Under a live mode
   this event would have fired twelve real restarts into a network fault they
   could not fix, then latched anyway.
+- **And the argument for the rule above.** On a build where rehearsals set the
+  durable latch, an incident like this left all twelve miners latched from
+  rehearsed attempts, so the watchdog was switched off fleet-wide until someone
+  ran `clear-attention all` — whether or not restarts were ever made live.
 
 ## Reading what happened
 

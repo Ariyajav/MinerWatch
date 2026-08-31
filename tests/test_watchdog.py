@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from minerwatch.models import Event, Miner, State, Schedule, Window, Range
+from minerwatch.models import (
+    Event, Miner, Range, RecoverWith, Schedule, State, WatchdogConfig, Window,
+)
 from minerwatch.store import init_db, is_needs_attention, record_event
 from minerwatch.watchdog import Watchdog
 
@@ -421,11 +423,21 @@ class TestClearAttentionDurability:
     comes back full and the miner re-latches on its very next attempt instead
     of getting its retry budget back. On the Windows host a restart is routine
     (a reboot, a config edit, Task Scheduler), so this is not a rare path.
+
+    These run live (`dry_run=False`, with the actuator mocked) because the
+    durable latch is a live-mode object: a rehearsal deliberately never sets
+    one, so exercising this path in dry-run would assert nothing.
     """
+
+    @staticmethod
+    def _live(conn, **kw):
+        wd = Watchdog(conn, fail_after=0, dry_run=False, cooldown=0, **kw)
+        wd.send_restart = AsyncMock(return_value=(True, "restart sent"))
+        return wd
 
     async def test_cleared_latch_restores_the_retry_budget_after_a_restart(self, conn):
         miner = always_working_miner()
-        w1 = Watchdog(conn, fail_after=0, dry_run=True, cooldown=0, max_restarts=3)
+        w1 = self._live(conn, max_restarts=3)
         for i in range(3):
             await w1.consider(miner, State.STOPPED, True, t(i * 10), "")
         # 4th attempt trips the latch.
@@ -435,7 +447,7 @@ class TestClearAttentionDurability:
         w1.clear_attention(miner.id)
         assert len(w1._attempts[miner.id]) < 3
 
-        w2 = Watchdog(conn, fail_after=0, dry_run=True, cooldown=0, max_restarts=3)
+        w2 = self._live(conn, max_restarts=3)
         assert miner.id not in w2._needs_attention
         assert len(w2._attempts.get(miner.id, [])) < 3, "the clear was undone by hydration"
 
@@ -445,10 +457,255 @@ class TestClearAttentionDurability:
 
     async def test_an_uncleared_latch_still_survives_a_restart(self, conn):
         miner = always_working_miner(id="still-latched")
-        w1 = Watchdog(conn, fail_after=0, dry_run=True, cooldown=0, max_restarts=2)
+        w1 = self._live(conn, max_restarts=2)
         for i in range(3):
             await w1.consider(miner, State.STOPPED, True, t(i * 10), "")
         assert miner.id in w1._needs_attention
 
-        w2 = Watchdog(conn, fail_after=0, dry_run=True, cooldown=0, max_restarts=2)
+        w2 = self._live(conn, max_restarts=2)
         assert miner.id in w2._needs_attention
+
+
+class TestRehearsalDoesNotPoisonTheLivePath:
+    """A dry run must not latch a miner it never touched.
+
+    `needs_attention` is hydrated at startup and survives into live mode. When
+    the rehearsal path set it, a rehearsing watchdog switched itself off for
+    that miner permanently: three `would_restart` rows, a real latch, and then
+    `skipped_needs_attention` forever - including after the operator moved to
+    a live mode, where the newly-live watchdog's first act was to decline to
+    restart a miner on the strength of a latch no restart had ever caused.
+    Only `clear-attention` released it, so the fault presented as "the watchdog
+    does nothing and a manual restart fixes it".
+
+    The sleeper already refuses to read its own rehearsal records back as fact.
+    This is the watchdog's half of the same rule.
+    """
+
+    async def _exhaust(self, conn, dry_run, miner=None):
+        """Drive a failing miner past max_restarts and return the watchdog."""
+        miner = miner or always_working_miner()
+        wd = Watchdog(conn, dry_run=dry_run, cooldown=0, fail_after=0,
+                      max_restarts=2, miners={miner.id: miner})
+        wd.send_restart = AsyncMock(return_value=(True, "restart sent"))
+        for i in range(4):
+            await wd.consider(miner, State.STOPPED, True, t(1000 + i * 100), "down")
+        return wd, miner
+
+    def _actions(self, conn, miner_id):
+        return [r[0] for r in conn.execute(
+            "SELECT action FROM events WHERE miner = ? ORDER BY id", (miner_id,)
+        ).fetchall()]
+
+    async def test_a_rehearsal_reaching_the_limit_sets_no_durable_latch(self, conn):
+        wd, miner = await self._exhaust(conn, dry_run=True)
+
+        actions = self._actions(conn, miner.id)
+        assert "would_restart" in actions
+        assert "would_need_attention" in actions, "the rehearsal should still show it hit the limit"
+        assert "needs_attention" not in actions, "a rehearsal must not write the real latch"
+        assert not is_needs_attention(conn, miner.id)
+        assert wd.send_restart.await_count == 0, "nothing may be sent in a rehearsal"
+
+    async def test_going_live_after_a_rehearsal_restarts_the_miner(self, conn):
+        """The regression that matters: rehearse, then switch to live."""
+        await self._exhaust(conn, dry_run=True)
+
+        miner = always_working_miner()
+        live = Watchdog(conn, dry_run=False, cooldown=0, fail_after=0,
+                        max_restarts=2, miners={miner.id: miner})
+        live.send_restart = AsyncMock(return_value=(True, "restart sent"))
+        await live.consider(miner, State.STOPPED, True, t(9000), "down")
+
+        assert live.send_restart.await_count == 1, (
+            "a miner latched only by rehearsal must not block the first live restart"
+        )
+        assert self._actions(conn, miner.id)[-1] == "restart"
+
+    async def test_a_live_run_reaching_the_limit_still_latches(self, conn):
+        """The safety property this must not break."""
+        wd, miner = await self._exhaust(conn, dry_run=False)
+
+        actions = self._actions(conn, miner.id)
+        assert "needs_attention" in actions
+        assert is_needs_attention(conn, miner.id)
+        assert wd.send_restart.await_count == 2, "exactly max_restarts attempts, then the latch"
+
+    async def test_the_rehearsal_latch_is_not_rebuilt_on_restart(self, conn):
+        """It is in-process only - a fresh Watchdog starts clean."""
+        await self._exhaust(conn, dry_run=True)
+
+        miner = always_working_miner()
+        fresh = Watchdog(conn, dry_run=True, cooldown=0, fail_after=0,
+                         max_restarts=2, miners={miner.id: miner})
+        assert fresh._rehearsed_attention == set()
+        assert fresh._needs_attention == set()
+
+    async def test_the_rehearsal_latch_stops_it_repeating_every_poll(self, conn):
+        """Without it a dry run writes the same decision at every poll interval."""
+        wd, miner = await self._exhaust(conn, dry_run=True)
+
+        actions = self._actions(conn, miner.id)
+        assert actions.count("would_need_attention") == 1
+        assert "skipped_would_need_attention" in actions, (
+            "later polls should record the withheld decision under its own action"
+        )
+        assert "skipped_needs_attention" not in actions, (
+            "a rehearsal must not look like a human-clearable latch"
+        )
+
+    async def test_clear_attention_releases_a_rehearsal_latch_too(self, conn):
+        wd, miner = await self._exhaust(conn, dry_run=True)
+        assert miner.id in wd._rehearsed_attention
+
+        wd.clear_attention(miner.id)
+        assert miner.id not in wd._rehearsed_attention
+
+
+class TestRecoveryMechanism:
+    """`recover_with` picks how an attempt tries to recover a miner.
+
+    The cgminer `restart` restarts the mining process over the API port, and
+    several stock Bitmain builds do not implement it at all - they answer
+    `Invalid command`, so every attempt fails, the retry budget is spent, and
+    the miner latches without anything having been tried that could work. The
+    reboot path exists for those firmwares.
+    """
+
+    def _miner(self, recover_with, **kw):
+        m = always_working_miner()
+        m.watchdog = WatchdogConfig(
+            fail_after_seconds=0, cooldown_seconds=900, rate_window_seconds=3600,
+            max_restarts=3, recover_with=recover_with, **kw,
+        )
+        return m
+
+    def _wd(self, conn, miner, restart_result, reboot_result=(True, "reboot accepted")):
+        wd = Watchdog(conn, dry_run=False, fail_after=0, cooldown=900,
+                      miners={miner.id: miner})
+        wd.send_restart = AsyncMock(return_value=restart_result)
+        wd.send_reboot = AsyncMock(return_value=reboot_result)
+        return wd
+
+    async def test_the_default_only_ever_sends_the_cgminer_restart(self, conn):
+        miner = self._miner(RecoverWith.CGMINER)
+        wd = self._wd(conn, miner, (False, "Invalid command"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert wd.send_restart.await_count == 1
+        assert wd.send_reboot.await_count == 0, "the default must not reboot anything"
+
+    async def test_bitmain_reboot_skips_the_restart_entirely(self, conn):
+        miner = self._miner(RecoverWith.BITMAIN_REBOOT)
+        wd = self._wd(conn, miner, (True, "restart acknowledged"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert wd.send_reboot.await_count == 1
+        assert wd.send_restart.await_count == 0
+
+    async def test_auto_does_not_escalate_when_the_restart_worked(self, conn):
+        miner = self._miner(RecoverWith.AUTO)
+        wd = self._wd(conn, miner, (True, "restart acknowledged"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert wd.send_restart.await_count == 1
+        assert wd.send_reboot.await_count == 0
+
+    async def test_auto_escalates_when_the_firmware_has_no_restart(self, conn):
+        """The exact reply seen in the field on stock S19 XP firmware."""
+        miner = self._miner(RecoverWith.AUTO)
+        wd = self._wd(conn, miner, (False, "Invalid command"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert wd.send_restart.await_count == 1
+        assert wd.send_reboot.await_count == 1
+        row = conn.execute(
+            "SELECT action, reason FROM events WHERE miner=? AND action LIKE 'restart%' "
+            "ORDER BY id DESC LIMIT 1", (miner.id,)).fetchone()
+        assert row[0] == "restart", "the escalated reboot succeeded, so the attempt succeeded"
+        assert "unsupported here" in row[1] and "escalated to reboot" in row[1]
+
+    async def test_auto_does_not_escalate_past_a_permissions_refusal(self, conn):
+        """`Access denied` is an api-allow problem, not the wrong mechanism.
+
+        Escalating past it would reboot a miner over a configuration typo.
+        """
+        miner = self._miner(RecoverWith.AUTO)
+        wd = self._wd(conn, miner, (False, "Access denied"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert wd.send_reboot.await_count == 0
+        assert self_last_action(conn, miner.id) == "restart_failed"
+
+    async def test_auto_does_not_escalate_when_the_miner_is_unreachable(self, conn):
+        """No TCP means no web UI either, in every case seen so far."""
+        miner = self._miner(RecoverWith.AUTO)
+        wd = self._wd(conn, miner, (False, "TimeoutError"))
+
+        await wd.consider(miner, State.UNREACHABLE, True, t(1000), "no route")
+
+        assert wd.send_reboot.await_count == 0
+
+    async def test_an_escalated_attempt_still_counts_as_one_attempt(self, conn):
+        """Trying two mechanisms must not halve the miner's retry budget."""
+        miner = self._miner(RecoverWith.AUTO)
+        wd = self._wd(conn, miner, (False, "Invalid command"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert len(wd._get_dq(miner.id)) == 1
+
+    async def test_a_failed_escalation_is_reported_as_a_failure(self, conn):
+        miner = self._miner(RecoverWith.AUTO)
+        wd = self._wd(conn, miner, (False, "Invalid command"),
+                      reboot_result=(False, "reboot: HTTP 401"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert self_last_action(conn, miner.id) == "restart_failed"
+
+    async def test_rebooting_is_still_rehearsed_in_dry_run(self, conn):
+        """The live gate applies to the heavier mechanism too, obviously."""
+        miner = self._miner(RecoverWith.BITMAIN_REBOOT)
+        wd = Watchdog(conn, dry_run=True, fail_after=0, cooldown=900,
+                      miners={miner.id: miner})
+        wd.send_reboot = AsyncMock(return_value=(True, "rebooted"))
+        wd.send_restart = AsyncMock(return_value=(True, "restarted"))
+
+        await wd.consider(miner, State.STOPPED, True, t(1000), "down")
+
+        assert wd.send_reboot.await_count == 0
+        assert wd.send_restart.await_count == 0
+        assert self_last_action(conn, miner.id) == "would_restart"
+
+    async def test_the_limit_still_latches_a_miner_that_reboots_cannot_fix(self, conn):
+        """A miner halting on a hardware fault comes back and halts again.
+
+        Nothing in the reboot request can tell that from a wedged process, so
+        the attempt limit is what bounds the loop.
+        """
+        miner = self._miner(RecoverWith.BITMAIN_REBOOT)
+        miner.watchdog = WatchdogConfig(
+            fail_after_seconds=0, cooldown_seconds=900, rate_window_seconds=3600,
+            max_restarts=2, recover_with=RecoverWith.BITMAIN_REBOOT)
+        wd = Watchdog(conn, dry_run=False, fail_after=0, cooldown=900,
+                      miners={miner.id: miner})
+        wd.send_reboot = AsyncMock(return_value=(True, "reboot accepted"))
+
+        for i in range(4):
+            await wd.consider(miner, State.STOPPED, True, t(1000 + i * 1000), "down")
+
+        assert wd.send_reboot.await_count == 2, "never more than max_restarts"
+        assert is_needs_attention(conn, miner.id)
+
+
+def self_last_action(conn, miner_id):
+    return conn.execute(
+        "SELECT action FROM events WHERE miner=? AND action LIKE 'restart%' "
+        "OR (miner=? AND action IN ('would_restart','needs_attention')) "
+        "ORDER BY id DESC LIMIT 1", (miner_id, miner_id)).fetchone()[0]

@@ -25,6 +25,31 @@ class SleepBackend(str, Enum):
     NONE = "none"
 
 
+class RecoverWith(str, Enum):
+    """How the watchdog tries to recover a failing miner.
+
+    ``CGMINER`` sends ``{"command":"restart"}`` over the API port. It restarts
+    the mining process only, and several stock Bitmain builds do not implement
+    it at all — they answer ``Invalid command``, which reads as a failed
+    attempt and burns the retry budget for nothing.
+
+    ``BITMAIN_REBOOT`` reboots the whole control board through the stock web
+    UI's reboot CGI, using the HTTP credentials from the miner's ``sleep:``
+    block. Heavier and slower, but it is the only software recovery that works
+    on firmware without a cgminer ``restart``.
+
+    ``AUTO`` sends the cgminer restart first and falls back to the reboot on
+    the same attempt *only* when the firmware says the command does not exist.
+    Any other failure — refused, unreachable, malformed — does not escalate,
+    because those mean something other than "this firmware needs the heavier
+    mechanism".
+    """
+
+    CGMINER = "cgminer"
+    BITMAIN_REBOOT = "bitmain_reboot"
+    AUTO = "auto"
+
+
 @dataclass
 class Range:
     start: int
@@ -150,6 +175,13 @@ class WatchdogConfig:
     rate_window_seconds: int = 3600
     #: Attempts inside that window before the miner is latched for a human.
     max_restarts: int = 3
+    #: Which recovery mechanism an attempt uses. Left at ``CGMINER`` the
+    #: watchdog behaves exactly as it always has.
+    recover_with: RecoverWith = RecoverWith.CGMINER
+    #: Path to the stock firmware's reboot CGI, used by ``BITMAIN_REBOOT`` and
+    #: by the ``AUTO`` fallback. Configurable because the path has moved
+    #: between firmware generations.
+    reboot_path: str = "/cgi-bin/reboot.cgi"
 
 
 @dataclass

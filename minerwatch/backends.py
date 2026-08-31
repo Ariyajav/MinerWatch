@@ -384,6 +384,89 @@ class BitmainHttpBackend(SleepBackendDriver):
         except Exception as exc:  # pragma: no cover - defensive
             return False, str(exc)
 
+    async def reboot(self, miner: Miner) -> Result:
+        """Reboot the whole control board through the stock web UI.
+
+        This is the watchdog's heavier recovery path, for firmware that has no
+        cgminer ``restart``. It is deliberately *not* part of the sleep
+        interface: sleeping is reversible and verifiable, a reboot is neither.
+
+        Two things make it safe enough to automate:
+
+        **It authenticates before it acts.** A read-only ``probe`` runs first,
+        so a wrong password or an unreachable web UI is reported without
+        anything being sent. That matters more here than for a work-mode write,
+        because a reboot cannot be undone by writing the old value back.
+
+        **It cannot be verified synchronously, and does not pretend to be.**
+        A work-mode write is confirmed by reading the field back; a reboot's
+        only evidence is the miner going away and returning, which arrives over
+        the following minutes of ordinary polling. So this returns success for
+        "the firmware accepted the request", and the docstring is the warning
+        that acceptance is not recovery.
+
+        What it explicitly does **not** do is decide whether rebooting is a
+        good idea. A miner that halted on a protective fault — a dead fan, an
+        over-temperature — will halt again within minutes of coming back, and
+        nothing in this request can tell that case from a wedged process. The
+        watchdog's attempt limit is what bounds the loop: after
+        ``max_restarts`` the miner latches for a human, which is the correct
+        outcome for a fault software cannot fix.
+        """
+        cfg = miner.watchdog
+        path = cfg.reboot_path if cfg is not None else "/cgi-bin/reboot.cgi"
+        budget = miner.sleep.timeout_seconds * 2 + 5
+
+        ok, detail = await self.probe(miner)
+        if not ok:
+            return False, f"reboot not sent - {detail}"
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._reboot_blocking, miner, path),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            # A reboot request legitimately never answers on some builds: the
+            # box goes down mid-response. Treat the timeout as "probably
+            # landed" rather than a failure, since the probe above proved the
+            # web UI was reachable a moment ago, and let the next polls decide.
+            return True, (
+                f"reboot sent to {self._base_url(miner)}{path}; no reply before the "
+                f"connection closed, which is normal for a reboot"
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"reboot: {exc}"
+
+    def _reboot_blocking(self, miner: Miner, path: str) -> Result:
+        base = self._base_url(miner)
+        url = f"{base}{path}"
+        try:
+            with self._build_opener(miner).open(
+                url, timeout=miner.sleep.timeout_seconds
+            ) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                return True, f"reboot accepted by {url} (HTTP {code})"
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return False, (
+                    f"reboot: {url} returned HTTP 404 - this firmware puts the reboot "
+                    f"CGI somewhere else. Find it in the miner's web UI and set "
+                    f"watchdog.reboot_path."
+                )
+            if exc.code in (401, 403):
+                return False, (
+                    f"reboot: HTTP {exc.code} - the web-UI username or password is "
+                    f"wrong (trying user '{miner.sleep.username}')"
+                )
+            return False, f"reboot: {url} returned HTTP {exc.code}"
+        except urllib.error.URLError as exc:
+            # The box dropping the connection as it goes down is success, not
+            # failure - the probe proved it was answering moments ago.
+            return True, f"reboot sent to {url}; connection dropped ({exc.reason})"
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"reboot: {exc}"
+
     # ------------------------------------------------------------------
     # Write diagnosis
     # ------------------------------------------------------------------

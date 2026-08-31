@@ -31,6 +31,7 @@ from minerwatch.models import (
     Schedule,
     SleepBackend,
     SleepConfig,
+    RecoverWith,
     WatchdogConfig,
     Window,
 )
@@ -193,7 +194,8 @@ def _parse_watchdog(raw: Any, base: WatchdogConfig) -> WatchdogConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"'watchdog' must be a mapping, got {type(raw).__name__}")
 
-    known = {"enabled", "fail_after_seconds", "cooldown_seconds", "rate_window_seconds", "max_restarts"}
+    known = {"enabled", "fail_after_seconds", "cooldown_seconds", "rate_window_seconds",
+             "max_restarts", "recover_with", "reboot_path"}
     unknown = set(raw) - known
     if unknown:
         # A typo here silently leaves a miner on the default policy, which for
@@ -215,7 +217,45 @@ def _parse_watchdog(raw: Any, base: WatchdogConfig) -> WatchdogConfig:
         if field in raw:
             changes[field] = _coerce_int(raw[field], f"watchdog.{field}", minimum)
 
+    if "recover_with" in raw:
+        value = raw["recover_with"]
+        try:
+            changes["recover_with"] = RecoverWith(str(value).strip().lower())
+        except ValueError:
+            valid = ", ".join(m.value for m in RecoverWith)
+            raise ConfigError(
+                f"Unknown watchdog.recover_with '{value}'. Valid: {valid}. "
+                f"'cgminer' restarts the mining process over the API port; "
+                f"'bitmain_reboot' reboots the control board through the stock web UI; "
+                f"'auto' tries the restart first and escalates only when the firmware "
+                f"answers that the command does not exist."
+            ) from None
+
+    if "reboot_path" in raw:
+        path = raw["reboot_path"]
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ConfigError(
+                f"'watchdog.reboot_path' must be an absolute path beginning with '/', "
+                f"got {path!r}"
+            )
+        changes["reboot_path"] = path
+
     merged = replace(base, **changes)
+
+    # A reboot is a heavier action than a restart and it cannot be undone, so
+    # spacing it like a process restart is a mistake worth refusing rather than
+    # documenting. A rebooting S19 is unreachable for minutes and then needs
+    # several more to reach full hashrate; at a 600s cooldown the second attempt
+    # lands while the first is still booting, which reads as a failure and
+    # spends the retry budget on a miner that was recovering normally.
+    if merged.recover_with is not RecoverWith.CGMINER and merged.cooldown_seconds < 900:
+        raise ConfigError(
+            f"'watchdog.cooldown_seconds' is {merged.cooldown_seconds}s, too short for "
+            f"recover_with: {merged.recover_with.value}. A rebooted miner is down for "
+            f"minutes and then spins up for several more, so a second attempt inside "
+            f"900s would fire at a miner that is already recovering. Raise it to at "
+            f"least 900 (and rate_window_seconds with it)."
+        )
     # The latch needs `max_restarts` attempts alive in the rate window at once,
     # and attempts are `cooldown_seconds` apart, so the span of the last
     # max_restarts-1 gaps has to fit inside the window. When it does not, the

@@ -4,7 +4,8 @@ from collections import deque
 from datetime import datetime
 
 from minerwatch import api
-from minerwatch.models import Event, Miner, State, WatchdogConfig
+from minerwatch.backends import BitmainHttpBackend
+from minerwatch.models import Event, Miner, RecoverWith, State, WatchdogConfig
 from minerwatch.store import (
     ClockRules,
     clear_needs_attention,
@@ -20,11 +21,13 @@ logger = logging.getLogger(__name__)
 IN_WINDOW_FAILURE_ACTIONS: tuple[str, ...] = (
     "waiting_to_restart",
     "skipped_needs_attention",
+    "skipped_would_need_attention",
     "skipped_cooldown",
     "would_restart",
     "restart",
     "restart_failed",
     "needs_attention",
+    "would_need_attention",
 )
 
 #: Actions that mean "not a failure we are counting", and therefore clear the
@@ -120,6 +123,11 @@ class Watchdog:
         self.fail_after = fail_after
         self._attempts: dict[str, deque[datetime]] = {}
         self._needs_attention: set[str] = set()
+        #: Miners a *rehearsal* drove past the restart limit. Deliberately not
+        #: hydrated from the events table and deliberately not persisted as a
+        #: real latch: it exists only to stop a dry run logging the same
+        #: decision every poll, and it dies with the process.
+        self._rehearsed_attention: set[str] = set()
         self._hydrate_needs_attention()
         self._hydrate_attempts()
 
@@ -255,9 +263,11 @@ class Watchdog:
           2. restarts disabled   → skipped_watchdog_disabled
           3. not working         → skipped_outside_hours
           4. needs_attention     → skipped_needs_attention
+             (rehearsal latch)   → skipped_would_need_attention
           5. failing < fail_after→ waiting_to_restart
           6. within cooldown     → skipped_cooldown
-          7. ≥max_restarts       → needs_attention (latch set)
+          7. ≥max_restarts       → needs_attention (latch set), or
+                                   would_need_attention when rehearsing
           8. dry_run             → would_restart  (deque advanced)
           9. else                → send_restart → restart / restart_failed
         """
@@ -283,9 +293,19 @@ class Watchdog:
             self._log(miner, state, "skipped_outside_hours", "outside working hours", now)
             return
 
-        # 4. Latched → skip
+        # 4. Latched → skip. The rehearsal latch is checked separately and
+        #    recorded under its own action, so a reader can tell "a human must
+        #    clear this" from "a rehearsal reached the limit and nothing was
+        #    ever sent".
         if miner.id in self._needs_attention:
             self._log(miner, state, "skipped_needs_attention", "miner is latched as needs_attention", now)
+            return
+        if miner.id in self._rehearsed_attention:
+            self._log(
+                miner, state, "skipped_would_need_attention",
+                "rehearsal reached the restart limit; nothing has been sent to this miner",
+                now,
+            )
             return
 
         # 5. Confirmation delay. A miner that missed one poll is not a broken
@@ -317,13 +337,34 @@ class Watchdog:
                 self._log(miner, state, "skipped_cooldown", f"cooldown active; last attempt at {last_ts.isoformat()}", now)
                 return
 
-        # 7. Rate-limit — evict expired entries, then check max
+        # 7. Rate-limit — evict expired entries, then check max.
+        #
+        #    A rehearsal must not set the real latch. `needs_attention` is
+        #    hydrated at startup and survives into live mode, so a rehearsing
+        #    watchdog that reached its limit used to switch itself off for that
+        #    miner permanently: three `would_restart` rows, a real latch, and
+        #    from then on `skipped_needs_attention` forever - including after
+        #    `-Mode live`, where the first thing the newly-live watchdog did was
+        #    decline to act on a latch no restart had ever caused. The sleeper
+        #    learned this same lesson (rehearsal records are not read back as
+        #    fact); this is the watchdog's half of it.
         self._evict_expired(dq, now, cfg.rate_window_seconds)
         if len(dq) >= cfg.max_restarts:
+            limit_reason = (
+                f"{cfg.max_restarts} restart attempts within {cfg.rate_window_seconds}s"
+            )
+            if self.dry_run:
+                self._rehearsed_attention.add(miner.id)
+                self._log(
+                    miner, state, "would_need_attention",
+                    f"dry-run: {limit_reason} would have latched this miner; nothing was sent",
+                    now,
+                )
+                return
             self._needs_attention.add(miner.id)
             self._log(
                 miner, state, "needs_attention",
-                f"{cfg.max_restarts} restart attempts within {cfg.rate_window_seconds}s; manual clear required",
+                f"{limit_reason}; manual clear required",
                 now,
             )
             return
@@ -337,7 +378,7 @@ class Watchdog:
             return
 
         # 9. Actuate
-        ok, detail = await self.send_restart(miner)
+        ok, detail = await self.recover(miner)
         dq.append(now_ts)
         action = "restart" if ok else "restart_failed"
         self._log(miner, state, action, detail, now)
@@ -353,11 +394,65 @@ class Watchdog:
     # TCP restart actuator
     # ------------------------------------------------------------------
 
+    #: Firmware replies that mean "this command does not exist here", as
+    #: opposed to "you may not call it" or "something went wrong". Only these
+    #: escalate under ``recover_with: auto`` — an `Access denied` is an
+    #: api-allow problem the operator must fix, and escalating past it would
+    #: reboot a miner over a permissions typo.
+    NOT_IMPLEMENTED_REPLIES: tuple[str, ...] = ("invalid command",)
+
+    async def recover(self, miner: Miner) -> tuple[bool, str]:
+        """Run one recovery attempt against *miner*, honouring ``recover_with``.
+
+        One attempt is one entry in the rate-limit deque however many mechanisms
+        it tried, so ``auto`` cannot double a miner's exposure: three attempts
+        remain three, and the miner still latches after ``max_restarts``.
+        """
+        cfg = self._resolve(miner)
+        mode = getattr(cfg, "recover_with", RecoverWith.CGMINER)
+
+        if mode is RecoverWith.BITMAIN_REBOOT:
+            return await self.send_reboot(miner)
+
+        ok, detail = await self.send_restart(miner)
+        if ok or mode is not RecoverWith.AUTO:
+            return ok, detail
+
+        if not any(s in detail.lower() for s in self.NOT_IMPLEMENTED_REPLIES):
+            # Refused, unreachable, malformed: all mean something other than
+            # "wrong mechanism", so escalating would be guessing.
+            return ok, detail
+
+        reboot_ok, reboot_detail = await self.send_reboot(miner)
+        return reboot_ok, (
+            f"cgminer restart unsupported here ({detail}); escalated to reboot - "
+            f"{reboot_detail}"
+        )
+
+    async def send_reboot(self, miner: Miner) -> tuple[bool, str]:
+        """Reboot the control board through the stock firmware's web UI.
+
+        Delegates to :class:`~minerwatch.backends.BitmainHttpBackend`, which
+        authenticates read-only before sending anything. The HTTP credentials
+        come from the miner's ``sleep:`` block deliberately: there is one
+        web-UI username, password and port per miner, and duplicating them
+        under ``watchdog:`` would create two places to get them wrong. Sleep
+        does not have to be enabled for the watchdog to use them.
+        """
+        try:
+            return await BitmainHttpBackend().reboot(miner)
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, str(exc) or type(exc).__name__
+
     async def send_restart(self, miner: Miner) -> tuple[bool, str]:
         """Send ``{"command":"restart"}`` to *miner* over TCP.
 
         Returns ``(True, "restart acknowledged")`` on success or ``(False, error_msg)`` on
         any exception or error response.  Never raises.
+
+        Note that this restarts the mining process, not the box, and that
+        several stock Bitmain builds do not implement it at all — they answer
+        ``Invalid command``. See ``recover_with`` for the escalation path.
         """
         try:
             # api.request reads until the NUL terminator rather than taking a
@@ -394,6 +489,7 @@ class Watchdog:
         entry is retained.
         """
         self._needs_attention.discard(miner_id)
+        self._rehearsed_attention.discard(miner_id)
         clear_needs_attention(self.conn, miner_id)
         if miner_id in self._attempts:
             self._trim_after_clear(self._attempts[miner_id], self._resolve_by_id(miner_id).max_restarts)
@@ -424,6 +520,7 @@ class Watchdog:
         "skipped_cooldown",
         "skipped_outside_hours",
         "skipped_needs_attention",
+        "skipped_would_need_attention",
         "skipped_watchdog_disabled",
     })
 

@@ -8,6 +8,7 @@ CGI — is actually covered.
 import asyncio
 import json
 import threading
+import urllib.error
 
 import pytest
 
@@ -17,7 +18,9 @@ from minerwatch.backends import (
     NullBackend,
     get_backend,
 )
-from minerwatch.models import Command, Miner, SleepBackend, SleepConfig
+from minerwatch.models import (
+    Command, Miner, RecoverWith, SleepBackend, SleepConfig, WatchdogConfig,
+)
 from sim.bitmain_http_sim import BitmainHttpServer, MinerConf
 from sim.miner_sim import SimServer, SimState
 
@@ -1157,3 +1160,81 @@ class TestAsymmetricFirmware:
             assert conf.miner_mode == 0, "diagnose must restore the original mode"
         finally:
             srv.shutdown(); srv.server_close()
+
+
+class TestWatchdogReboot:
+    """The heavier recovery path, for firmware with no cgminer `restart`.
+
+    Observed in the field: stock S19 XP firmware answers `Invalid command` to
+    {"command":"restart"}, so the watchdog's only actuator did nothing while
+    spending the retry budget. Rebooting the control board through the web UI
+    is the one software recovery that firmware does implement.
+    """
+
+    def _miner(self, port, reboot_path="/cgi-bin/reboot.cgi", **kw):
+        d = dict(enabled=True, backend=SleepBackend.BITMAIN_HTTP, http_port=port,
+                 username="root", password="root", timeout_seconds=5)
+        return Miner(
+            id="sxp-01", host="127.0.0.1", port=4028,
+            sleep=SleepConfig(**{**d, **kw}),
+            watchdog=WatchdogConfig(reboot_path=reboot_path,
+                                    recover_with=RecoverWith.BITMAIN_REBOOT,
+                                    cooldown_seconds=900),
+        )
+
+    async def test_nothing_is_sent_when_the_web_ui_cannot_be_reached(self):
+        """A reboot cannot be undone, so it authenticates read-only first."""
+        # Port 1 is not listening; probe fails before anything is sent.
+        miner = self._miner(1)
+        ok, detail = await BitmainHttpBackend().reboot(miner)
+        assert not ok
+        assert "reboot not sent" in detail
+
+    async def test_a_wrong_password_stops_it_before_the_reboot(self, http_sim):
+        _, port = http_sim
+        miner = self._miner(port, password="wrong")
+        ok, detail = await BitmainHttpBackend().reboot(miner)
+        assert not ok
+        assert "reboot not sent" in detail
+        assert "username or password is wrong" in detail
+
+    async def test_a_missing_cgi_names_the_setting_that_fixes_it(self, http_sim):
+        """Firmwares moved the reboot CGI, so 404 must be actionable."""
+        _, port = http_sim
+        miner = self._miner(port, reboot_path="/cgi-bin/reboot.cgi")
+        ok, detail = await BitmainHttpBackend().reboot(miner)
+        assert not ok
+        assert "404" in detail
+        assert "watchdog.reboot_path" in detail
+
+    async def test_an_accepted_request_reports_success(self, http_sim):
+        """Pointed at an endpoint the simulator answers 200 to.
+
+        Acceptance is all a reboot can report synchronously: the box goes down
+        mid-response, so the real evidence is the miner disappearing from the
+        next few polls and coming back.
+        """
+        _, port = http_sim
+        miner = self._miner(port, reboot_path="/cgi-bin/get_miner_conf.cgi")
+        ok, detail = await BitmainHttpBackend().reboot(miner)
+        assert ok
+        assert "accepted" in detail and "200" in detail
+
+    async def test_a_dropped_connection_counts_as_sent(self):
+        """A rebooting box drops the socket; that is success, not failure.
+
+        The probe proved the web UI was answering moments earlier, so a
+        connection that dies during the reboot request is evidence the request
+        landed - reporting it as a failure would spend another retry.
+        """
+        backend = BitmainHttpBackend()
+        miner = self._miner(80)
+
+        class Boom:
+            def open(self, *a, **kw):
+                raise urllib.error.URLError("connection reset")
+
+        backend._build_opener = lambda m: Boom()
+        ok, detail = backend._reboot_blocking(miner, "/cgi-bin/reboot.cgi")
+        assert ok
+        assert "connection dropped" in detail

@@ -35,7 +35,7 @@ from minerwatch.compat import (
 )
 from minerwatch.config import ConfigError, lint_miners, load_config
 from minerwatch.backends import get_backend
-from minerwatch.models import SleepBackend, State
+from minerwatch.models import RecoverWith, SleepBackend, State
 from minerwatch.poller import Poller
 from minerwatch.schedule import is_working_time
 from minerwatch.sleeper import SleepController
@@ -486,7 +486,11 @@ def _fmt_watchdog(miner) -> str:
         return f"immediate, max {cfg.max_restarts}"
     minutes = cfg.fail_after_seconds / 60
     delay = f"{minutes:.0f}m" if minutes == int(minutes) else f"{minutes:.1f}m"
-    return f"after {delay}, max {cfg.max_restarts}"
+    # Name the mechanism whenever it is not the default. A miner set to reboot
+    # its control board is doing something materially heavier than restarting
+    # bmminer, and the config table is where an operator would look for that.
+    how = "" if cfg.recover_with is RecoverWith.CGMINER else f", {cfg.recover_with.value}"
+    return f"after {delay}, max {cfg.max_restarts}{how}"
 
 
 def cmd_config(args, config, conn) -> int:
@@ -744,6 +748,10 @@ ACTION_MEANING = {
     "skipped_needs_attention": "restart withheld: latched for a human",
     "skipped_watchdog_disabled": "restart withheld: disabled for this miner",
     "needs_attention": "LATCHED: restart limit reached, manual clear needed",
+    "would_need_attention": "rehearsal hit the restart limit - nothing sent, no latch set",
+    "reboot": "control board rebooted via the web UI",
+    "reboot_failed": "the reboot could not be delivered",
+    "skipped_would_need_attention": "restart withheld: rehearsal already hit the limit",
     "attention_cleared": "watchdog latch released by an operator",
 }
 

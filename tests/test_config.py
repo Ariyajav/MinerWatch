@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from minerwatch.config import ConfigError, load_config
+from minerwatch.models import RecoverWith
 
 from .fixtures import MINERS_YAML
 
@@ -393,3 +394,60 @@ class TestPostFormat:
         raw = base_config(sleep={"enabled": True, "post_format": "xml"})
         with pytest.raises(ConfigError, match="must be json or form"):
             load_config(write_config(raw))
+
+
+class TestRecoverWith:
+    """The watchdog's recovery mechanism is configurable, and validated.
+
+    A typo here is silent at runtime and only shows up as a miner that never
+    recovers, so every wrong value is refused with the alternatives named.
+    """
+
+    @staticmethod
+    def _cfg(**watchdog):
+        base = {"enabled": True, "cooldown_seconds": 900, "rate_window_seconds": 3600,
+                "max_restarts": 3}
+        return base_config(watchdog={**base, **watchdog})
+
+    def _load(self, raw):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            yaml.safe_dump(raw, f)
+            path = f.name
+        try:
+            return load_config(path)
+        finally:
+            os.unlink(path)
+
+    def test_the_default_is_the_cgminer_restart(self):
+        _, _, _, miners = self._load(self._cfg())
+        assert miners["a"].watchdog.recover_with is RecoverWith.CGMINER
+
+    def test_each_mechanism_parses(self):
+        for name, expected in (
+            ("cgminer", RecoverWith.CGMINER),
+            ("bitmain_reboot", RecoverWith.BITMAIN_REBOOT),
+            ("auto", RecoverWith.AUTO),
+        ):
+            _, _, _, miners = self._load(self._cfg(recover_with=name))
+            assert miners["a"].watchdog.recover_with is expected
+
+    def test_an_unknown_mechanism_names_the_alternatives(self):
+        with pytest.raises(ConfigError, match="bitmain_reboot"):
+            self._load(self._cfg(recover_with="reboot"))
+
+    def test_a_relative_reboot_path_is_refused(self):
+        with pytest.raises(ConfigError, match="absolute path"):
+            self._load(self._cfg(recover_with="bitmain_reboot", reboot_path="cgi-bin/reboot.cgi"))
+
+    def test_a_restart_length_cooldown_is_refused_for_a_reboot(self):
+        """A rebooted miner is down for minutes and spins up for several more.
+
+        At a restart-sized cooldown the second attempt lands on a miner that is
+        already recovering, reads as a failure, and spends the retry budget.
+        """
+        with pytest.raises(ConfigError, match="too short for"):
+            self._load(self._cfg(recover_with="bitmain_reboot", cooldown_seconds=600))
+
+    def test_that_floor_does_not_apply_to_the_cgminer_default(self):
+        _, _, _, miners = self._load(self._cfg(cooldown_seconds=600))
+        assert miners["a"].watchdog.cooldown_seconds == 600

@@ -37,6 +37,33 @@ watchdog:
   # limit is never reached, and a miner that restarting cannot fix is restarted
   # forever instead of latching. The config refuses such a policy.
 
+  # How an attempt tries to recover the miner.
+  #
+  # cgminer         {"command":"restart"} over the API port. Restarts the
+  #                 mining process, not the box. Several stock Bitmain builds
+  #                 do not implement it and answer "Invalid command", so every
+  #                 attempt fails and the retry budget is spent for nothing.
+  # bitmain_reboot  Reboots the control board through the stock web UI, using
+  #                 the HTTP credentials from this miner's sleep: block. The
+  #                 only software recovery that works on those firmwares.
+  # auto            Sends the cgminer restart and escalates to the reboot on
+  #                 the same attempt ONLY if the firmware says the command does
+  #                 not exist. A refusal or an unreachable miner does not
+  #                 escalate - those mean something other than "wrong
+  #                 mechanism".
+  #
+  # Run `diagnose <miner>` or read a restart_failed row in `history` to find
+  # out which your firmware needs. Anything other than cgminer requires
+  # cooldown_seconds >= 900, because a rebooted miner is unreachable for
+  # minutes and then spins up for several more.
+  recover_with: cgminer
+  # reboot_path: /cgi-bin/reboot.cgi   # only if your firmware moved it
+
+  # A reboot is not a fix for a hardware fault. A miner that halted on a dead
+  # fan comes back and halts again, and nothing in the request can tell that
+  # from a wedged process - max_restarts is what bounds the loop before the
+  # miner latches for a human.
+
 # ---------------------------------------------------------------------------
 # Software power control ("sleep")
 # ---------------------------------------------------------------------------

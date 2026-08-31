@@ -24,6 +24,9 @@ can stop a fleet can also stop it by accident.
   changes it then discards
 - Watchdog with a continuous-failure clock, cooldown, rate limiting, and a
   manual-attention latch
+- **Two recovery mechanisms** — the cgminer `restart`, or a control-board
+  reboot through the stock web UI for firmware that has no `restart` at all,
+  with automatic escalation between them
 - SQLite event log that survives restarts — every latch is rebuilt from it, so
   a process started twenty minutes before a scheduled wake still knows what it
   owes each miner
@@ -134,6 +137,12 @@ the decision survives a restart of MinerWatch itself.
 | --- | --- | --- |
 | `cgminer` | JSON over the miner's API port: `ascset 0,sleep` / `0,wake`, falling back to `pause` / `resume` | Vnish, Braiins OS+, and other firmwares that expose a real sleep on the socket |
 | `bitmain_http` | Digest-authenticated CGI on the web UI, setting the power-mode field to `1` (sleep) or `0` (normal) | Bitmain stock firmware, S17/S19 generation |
+
+The watchdog has its own equivalent split. Several stock Bitmain builds answer
+`Invalid command` to the cgminer `restart`, so every attempt fails and the retry
+budget is spent for nothing; `watchdog.recover_with` selects a control-board
+reboot instead, or `auto` to escalate only when the firmware says the command
+does not exist. See [docs/watchdog.md](docs/watchdog.md#choosing-a-recovery-mechanism).
 
 The `cgminer` backend tries each configured command in order and keeps the
 first one the firmware accepts, so a mixed fleet can share one setting. A
