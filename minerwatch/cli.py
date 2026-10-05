@@ -32,6 +32,7 @@ from minerwatch.compat import (
     TimezoneDataMissing,
     configure_console,
     install_signal_handlers,
+    resolve_path,
 )
 from minerwatch.config import ConfigError, lint_miners, load_config
 from minerwatch.backends import get_backend
@@ -119,6 +120,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     clear = sub.add_parser("clear-attention", help="Release a failure latch")
     clear.add_argument("miner", help="Miner id")
+
+    web = sub.add_parser(
+        "web",
+        help="Serve a read-only dashboard of status and history in a browser",
+    )
+    web.add_argument(
+        "--host", default="127.0.0.1",
+        help="Address to listen on (default: 127.0.0.1, this PC only; "
+             "0.0.0.0 to reach it from other machines on the network)",
+    )
+    web.add_argument("--port", type=int, default=8787, help="Port (default: 8787)")
+    web.add_argument(
+        "--alerts-file", default="alerts.json", metavar="PATH",
+        help="Email alert settings, edited from the page (default: alerts.json "
+             "beside the config). Holds the SMTP password, so keep it private.",
+    )
+    web.add_argument("--no-alerts", action="store_true",
+                     help="Do not send email alerts or show their settings")
+    web.add_argument(
+        "--allow-remote-settings", action="store_true",
+        help="Let other machines change the alert settings (default: this PC only)",
+    )
 
     hist = sub.add_parser(
         "history",
@@ -862,8 +885,19 @@ def cmd_clear_attention(args, config, conn) -> int:
     return 0
 
 
+def cmd_web(args, config, conn) -> int:
+    """Serve the dashboard. It opens its own read-only connections per request."""
+    from minerwatch.web import serve
+
+    poll_interval, db_path, _, miners = config
+    alerts_path = None if args.no_alerts else resolve_path(args.alerts_file, args.config)
+    return serve(args.host, args.port, db_path, miners, poll_interval, alerts_path,
+                 args.allow_remote_settings)
+
+
 #: Every subcommand name, used to tell a bare config path from a subcommand.
-_COMMANDS = ("run", "sleep", "wake", "status", "config", "check", "diagnose", "clear-attention")
+_COMMANDS = ("run", "sleep", "wake", "status", "config", "check", "diagnose",
+             "clear-attention", "history", "web")
 
 
 def _normalise_argv(argv: list[str] | None) -> list[str]:
@@ -927,6 +961,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_clear_attention(args, config, conn)
         if args.command == "history":
             return cmd_history(args, config, conn)
+        if args.command == "web":
+            return cmd_web(args, config, conn)
         parser.print_help()
         return 2
     finally:

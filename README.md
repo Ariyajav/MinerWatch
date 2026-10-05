@@ -30,6 +30,10 @@ can stop a fleet can also stop it by accident.
 - SQLite event log that survives restarts — every latch is rebuilt from it, so
   a process started twenty minutes before a scheduled wake still knows what it
   owes each miner
+- **Web dashboard** (`minerwatch web`) — fleet state, latched miners, a stalled
+  supervisor, and each miner's hashrate and decisions, in a browser
+- **Email alerts** for latched miners, a stopped supervisor, unconfirmed sleeps
+  and miners down inside their window, with SMTP set up from the dashboard
 - Hardware-free simulators for both control paths
 - Dry-run by default: nothing reaches a miner until you say so twice
 
@@ -115,7 +119,40 @@ minerwatch -c miners.yaml history all --decisions --hours 24
 minerwatch -c miners.yaml sleep miner-01 --live
 minerwatch -c miners.yaml wake  all   --live
 minerwatch -c miners.yaml clear-attention miner-01
+minerwatch -c miners.yaml web                 # read-only dashboard on http://localhost:8787/
 ```
+
+`web` reads the same database as `status` through a read-only connection, so
+it can run alongside the supervisor and cannot change a miner or the database.
+It listens on this PC only; pass `--host 0.0.0.0` to open it to the network
+(there is no login, so only do that on a network you trust) and `--port` to
+move it.
+
+### Email alerts
+
+The dashboard also sends email when something needs a human. Click **Email
+alerts** on the page to enter the SMTP server, recipients and which conditions
+to report, then **Send test email** before relying on it:
+
+| Condition | Default |
+| --- | --- |
+| A miner is latched and MinerWatch has stopped acting on it | on |
+| The supervisor stops polling (no poll for 3 intervals, at least 60s) | on |
+| A sleep failed or was not confirmed, so the miner may be asleep unnoticed | on |
+| A miner is not mining inside its window for N minutes (and was not slept on purpose) | 45 min |
+| Re-send a still-active alert every N hours | 12 h |
+| Email again when a condition clears | on |
+
+Changes that happen in the same check go out as one email. Alerts are sent by
+the `web` process, not the supervisor, so a stopped supervisor is still
+reported: keep `web` running (for example as its own scheduled task) for alerts
+to work.
+
+Settings are saved to `alerts.json` beside the config (`--alerts-file` to move
+it), with the SMTP password in plain text, so keep that file private; it is
+gitignored. The page never sends the password back to the browser. Settings
+can only be changed from the PC running `web`, unless it is started with
+`--allow-remote-settings`. `--no-alerts` turns the feature off.
 
 Equivalently `python -m minerwatch ...`. The historic form
 `python -m minerwatch miners.yaml` still works and means `run`.
