@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +40,12 @@ from minerwatch.models import Command, Miner, SleepBackend, SleepConfig
 logger = logging.getLogger(__name__)
 
 Result = tuple[bool, str]
+
+#: Seconds to wait before the last re-read when a mode change looks like it did
+#: not take. An S19 XP kept hashing for 19 seconds after the command that slept it,
+#: so "did not take", measured milliseconds after the POST, is a guess — and it
+#: is the expensive guess to get wrong. See :meth:`BitmainHttpBackend._set_mode_blocking`.
+DEFAULT_SETTLE_SECONDS = 20
 
 
 class SleepBackendDriver:
@@ -384,6 +391,64 @@ class BitmainHttpBackend(SleepBackendDriver):
         except Exception as exc:  # pragma: no cover - defensive
             return False, str(exc)
 
+    # ------------------------------------------------------------------
+    # Read-only power-mode query
+    # ------------------------------------------------------------------
+
+    async def is_asleep(self, miner: Miner) -> "tuple[bool | None, str]":
+        """Is this miner in software sleep right now? Read-only.
+
+        ``(True, detail)`` when the firmware reports the sleep value,
+        ``(False, detail)`` when it reports the normal one, and
+        ``(None, detail)`` when the question cannot be answered — unreachable,
+        wrong credentials, no power-mode field, or a value that is neither.
+
+        ``None`` is not ``False``, and callers must not collapse the two. The
+        watchdog uses this to decide whether a restart would be pointless;
+        answering "not asleep" for a miner we merely failed to read would be a
+        guess wearing the clothes of a fact.
+        """
+        mode, detail = await self.read_mode(miner)
+        if mode is None:
+            return None, detail
+        if mode == self._value(miner, sleep=True):
+            return True, f"{detail} (SLEEPING)"
+        if mode == self._value(miner, sleep=False):
+            return False, f"{detail} (normal)"
+        return None, f"{detail} (unrecognised power mode)"
+
+    async def read_mode(self, miner: Miner) -> "tuple[int | None, str]":
+        """Read the current power-mode value. Never writes.
+
+        Deliberately cheaper than :meth:`probe` — one GET, no interpretation of
+        credentials or field names beyond what is needed — because the watchdog
+        calls this on the path to a restart decision, where every second is a
+        second a genuinely dead miner is not being recovered.
+        """
+        budget = miner.sleep.timeout_seconds + 5
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._read_mode_blocking, miner),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            return None, f"no reply from {self._base_url(miner)} within {budget:.0f}s"
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, str(exc) or type(exc).__name__
+
+    def _read_mode_blocking(self, miner: Miner) -> "tuple[int | None, str]":
+        base = self._base_url(miner)
+        conf = self._read_conf(miner)
+        if conf is None:
+            return None, f"could not read the miner config at {base}"
+        key = self._mode_key(miner, conf)
+        if key is None:
+            return None, f"{base}: no power-mode field in the miner config"
+        mode = _as_int(conf.get(key))
+        if mode is None:
+            return None, f"{base}: {key} is not a number ({conf.get(key)!r})"
+        return mode, f"{key}={mode}"
+
     async def reboot(self, miner: Miner) -> Result:
         """Reboot the whole control board through the stock web UI.
 
@@ -412,6 +477,12 @@ class BitmainHttpBackend(SleepBackendDriver):
         watchdog's attempt limit is what bounds the loop: after
         ``max_restarts`` the miner latches for a human, which is the correct
         outcome for a fault software cannot fix.
+
+        One case it cannot fix at all: **a sleeping miner boots back into
+        sleep.** The mode is persistent across a reboot, so three attempts and
+        a latch leave the miner exactly as asleep as it started (an S19 XP,
+        15 Sep 2026). The watchdog checks :meth:`is_asleep` before it gets
+        here; this note is the reason that check exists.
         """
         cfg = miner.watchdog
         path = cfg.reboot_path if cfg is not None else "/cgi-bin/reboot.cgi"
@@ -495,6 +566,11 @@ class BitmainHttpBackend(SleepBackendDriver):
         Every attempt is verified by reading the config back, and anything that
         fails is proven to have changed nothing — which is what makes trying
         several shapes safe. The original value is restored at the end.
+
+        **This writes.** It moves the miner's power mode and puts it back, so
+        the miner stops hashing and has to spin up again — several minutes on
+        an S19 XP. Never run it against a producing miner; run it inside the
+        miner's own sleep window, or on one that is already stopped.
         """
         return await asyncio.wait_for(
             asyncio.to_thread(self._diagnose_blocking, miner),
@@ -668,11 +744,17 @@ class BitmainHttpBackend(SleepBackendDriver):
         a wedged call cannot stall the poll loop forever; the worker may still
         finish afterwards and change ``miner-mode`` after this reported failure.
         The real bound is urllib's own per-request socket timeout, which caps
-        the whole exchange at roughly ``2 x timeout_seconds`` (one GET, one
-        POST) — keep ``timeout_seconds`` modest, because that same bound is how
-        long a Ctrl+C can be delayed while the executor drains at shutdown.
+        each exchange at roughly ``timeout_seconds`` — keep ``timeout_seconds``
+        modest, because that same bound is how long a Ctrl+C can be delayed
+        while the executor drains at shutdown.
         """
-        budget = miner.sleep.timeout_seconds * 2 + 5
+        settle = int(getattr(miner.sleep, "settle_seconds", DEFAULT_SETTLE_SECONDS))
+        # Up to two write shapes, each a POST plus a verifying GET, after the
+        # opening GET, plus the settle window and its own re-read. The previous
+        # budget assumed one GET and one POST and was already optimistic before
+        # the settle was added: a timeout here does not stop the worker, it just
+        # means the result is reported as a failure the miner may yet contradict.
+        budget = miner.sleep.timeout_seconds * 6 + max(settle, 0) + 10
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._set_mode_blocking, miner, mode, label),
@@ -764,6 +846,22 @@ class BitmainHttpBackend(SleepBackendDriver):
                 miner, doc, getattr(cfg, "post_format", "json"), content_type
             )
             if not posted:
+                # A POST that errored does NOT prove the write did not land.
+                # set_miner_conf.cgi applies the change and then stops bmminer,
+                # and on this firmware the CGI can die with it: an S19 XP's 15 Sep
+                # 2026 sleep answered HTTP 500 on the very shape that works
+                # every other night, and the miner slept anyway. Believing the
+                # error cost about fourteen hours - `sleep_failed` meant no wake
+                # was sent when the window reopened, and the watchdog spent
+                # three control-board reboots on a miner that was sleeping on
+                # purpose. So verify before believing the error.
+                verified, _ = self._verify_blocking(miner, key, mode)
+                if verified:
+                    via = f" via {write_key}" if write_key != key else ""
+                    return True, (
+                        f"{label}: {key} {current!r} -> {mode}{via}, verified "
+                        f"(the POST itself reported {reply})"
+                    )
                 attempts.append(f"{write_key}: {reply}")
                 continue
 
@@ -773,10 +871,27 @@ class BitmainHttpBackend(SleepBackendDriver):
                 return True, f"{label}: {key} {current!r} -> {mode}{via}, verified"
             attempts.append(f"{write_key}: {detail}")
 
+        # One last look before declaring failure. Every verify above happens
+        # milliseconds after its own POST, and this hardware does not change
+        # mode instantly - an S19 XP kept hashing for 19 seconds after the command
+        # that slept it. A sleep wrongly reported as failed is the expensive
+        # direction to be wrong in, because the caller then has no idea where
+        # the miner actually is, so spend a few seconds here rather than leave
+        # one stopped and unrecognised until morning.
+        settle = int(getattr(cfg, "settle_seconds", DEFAULT_SETTLE_SECONDS))
+        if settle > 0:
+            time.sleep(settle)
+            verified, _ = self._verify_blocking(miner, key, mode)
+            if verified:
+                return True, (
+                    f"{label}: {key} {current!r} -> {mode}, verified after a "
+                    f"{settle}s settle (the write was slow to show, not lost)"
+                )
+
         return False, (
             f"{label}: the miner accepted the change but it did not persist. "
-            f"Tried {'; '.join(attempts)}. Run `diagnose {miner.id}` to search the "
-            f"remaining request shapes."
+            f"Tried {'; '.join(attempts)}; still wrong after a {settle}s settle. "
+            f"Run `diagnose {miner.id}` to search the remaining request shapes."
         )
 
     def _verify_blocking(self, miner: Miner, key: str, expected: int) -> Result:

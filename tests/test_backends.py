@@ -12,6 +12,7 @@ import urllib.error
 
 import pytest
 
+from minerwatch import backends
 from minerwatch.backends import (
     BitmainHttpBackend,
     CgminerBackend,
@@ -252,8 +253,11 @@ class TestBitmainHttpBackend:
         miner = http_miner(80, timeout_seconds=0.01)
 
         async def never_finishes(fn, *args, **kwargs):
-            await asyncio.sleep(30)
+            await asyncio.Event().wait()
 
+        # The settle window is part of the budget; without it this test would
+        # sit through the full 20s default before the timeout fires.
+        monkeypatch.setattr(backends, "DEFAULT_SETTLE_SECONDS", 0)
         monkeypatch.setattr(asyncio, "to_thread", never_finishes)
         ok, detail = await BitmainHttpBackend().sleep(miner)
         assert not ok

@@ -747,6 +747,7 @@ ACTION_MEANING = {
     "skipped_outside_hours": "restart withheld: outside its window",
     "skipped_needs_attention": "restart withheld: latched for a human",
     "skipped_watchdog_disabled": "restart withheld: disabled for this miner",
+    "skipped_asleep": "restart withheld: the miner reports it is in sleep mode",
     "needs_attention": "LATCHED: restart limit reached, manual clear needed",
     "would_need_attention": "rehearsal hit the restart limit - nothing sent, no latch set",
     "reboot": "control board rebooted via the web UI",

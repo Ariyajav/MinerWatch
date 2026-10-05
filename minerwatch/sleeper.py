@@ -41,6 +41,11 @@ POWER_ACTIONS = SLEEP_ACTIONS + WAKE_ACTIONS
 # are written purely so an operator can see what would have happened.
 DRY_RUN_ACTIONS = ("would_sleep", "would_wake")
 FAILURE_ACTIONS = ("sleep_failed", "wake_failed")
+#: Actions after which MinerWatch cannot know where the miner ended up. A failed
+#: sleep is the dangerous one: the command may well have taken and only the
+#: acknowledgement been lost, which is exactly what happened to an S19 XP on
+#: 15 Sep 2026. Recording "awake" there is a guess, and it was the wrong one.
+UNCERTAIN_ACTIONS = ("sleep_failed",)
 #: Actions that represent MinerWatch actually trying to change a miner's power
 #: state. "awake" is an *observation* and is deliberately excluded: counting it
 #: as an attempt would push the cooldown forward past the real one.
@@ -87,6 +92,10 @@ class SleepController:
         #: actually stop the miner. Tracked separately from ``_failures``
         #: because each of those attempts reports success.
         self._ineffective: dict[str, int] = {}
+        #: miner id -> time of a sleep whose outcome we could not confirm. Not
+        #: the same as asleep: we do not know. Treated as "possibly asleep" at
+        #: window open, which is the only place the difference is expensive.
+        self._uncertain: dict[str, datetime] = {}
         #: miners latched off after repeated failures
         self._attention: set[str] = set()
         self._hydrate(miners or {})
@@ -107,9 +116,17 @@ class SleepController:
         tracked = POWER_ACTIONS + FAILURE_ACTIONS + ATTENTION_ACTIONS
         known = set(miners) | set(miners_with_actions(self.conn, tracked))
         for miner_id in known:
-            last_power = last_action_in(self.conn, miner_id, POWER_ACTIONS)
+            # Look these up together so the *most recent* wins: a sleep_failed
+            # after the last wake leaves the miner possibly asleep, while a wake
+            # after a sleep_failed settles it.
+            last_power = last_action_in(self.conn, miner_id, POWER_ACTIONS + UNCERTAIN_ACTIONS)
             if last_power is not None:
-                if last_power.action in SLEEP_ACTIONS:
+                if last_power.action in UNCERTAIN_ACTIONS:
+                    # Doubt has to survive a process restart too. Without this a
+                    # service bounce silently resolves "we do not know" as
+                    # "awake", which is the assumption that cost 15 Sep.
+                    self._uncertain[miner_id] = _parse_ts(last_power.ts) or _utcnow(None)
+                elif last_power.action in SLEEP_ACTIONS:
                     # Fall back to "now" rather than dropping the latch: an
                     # unparseable timestamp must not make MinerWatch forget it
                     # slept a miner, or the watchdog starts restarting a device
@@ -166,6 +183,10 @@ class SleepController:
     def is_asleep(self, miner_id: str) -> bool:
         return miner_id in self._asleep
 
+    def is_uncertain(self, miner_id: str) -> bool:
+        """A sleep was attempted and its outcome never confirmed."""
+        return miner_id in self._uncertain
+
     def needs_attention(self, miner_id: str) -> bool:
         return miner_id in self._attention
 
@@ -174,6 +195,7 @@ class SleepController:
         self._attention.discard(miner_id)
         self._failures.pop(miner_id, None)
         self._ineffective.pop(miner_id, None)
+        self._uncertain.pop(miner_id, None)
         self._last_attempt.pop(miner_id, None)
         self._cooldown_logged.pop(miner_id, None)
         self._record(miner_id, State.UNREACHABLE, CLEARED_ACTION, "manual clear")
@@ -199,7 +221,8 @@ class SleepController:
         5. unreachable                       -> not owned
         6. outside window and mining         -> sleep
         7. outside window and stopped        -> owned iff we slept it
-        8. inside window and stopped by us   -> wake
+        8. inside window and stopped by us,
+           or after a sleep we could not confirm -> wake
         9. anything else                     -> not owned
 
         Step 2 runs before step 3 deliberately. If the failure latch were
@@ -217,6 +240,11 @@ class SleepController:
         # watchdog (it can still be slept manually through the CLI).
         if miner.schedule is None:
             return False
+
+        # A miner that is demonstrably hashing answers the question a failed
+        # sleep left open.
+        if state == State.MINING:
+            self._uncertain.pop(miner.id, None)
 
         # 2. Still hashing although we believe we slept it.
         sleep_ts = self._asleep.get(miner.id)
@@ -304,8 +332,12 @@ class SleepController:
                 return True
             return False
 
-        # 8. Inside the window and stopped by us -> wake it back up.
-        if state == State.STOPPED and miner.id in self._asleep:
+        # 8. Inside the window and stopped -> wake it, if we put it to sleep or
+        #    cannot rule out that we did. Waking a miner that is merely broken
+        #    costs one no-op write (the backend answers "already mode=0") and
+        #    one grace period before the watchdog takes over. Not waking one
+        #    that was actually asleep cost fourteen hours on 15 Sep 2026.
+        if state == State.STOPPED and (miner.id in self._asleep or miner.id in self._uncertain):
             return await self._transition(miner, state, now, to_sleep=False)
 
         return False
@@ -397,6 +429,13 @@ class SleepController:
         else:
             count = self._failures.get(miner.id, 0) + 1
             self._failures[miner.id] = count
+            if to_sleep:
+                # We asked it to sleep and cannot confirm what happened. Do not
+                # record "awake" by omission — step 8 needs to know to try a
+                # wake when the window reopens. An S19 XP, 15 Sep 2026: the sleep
+                # had in fact taken, only the acknowledgement was lost, and
+                # assuming "awake" meant no wake was ever sent.
+                self._uncertain[miner.id] = now
             self._record(miner.id, state, f"{label}_failed", f"{detail} (failure {count})", now)
             if not forced and count >= miner.sleep.max_failures:
                 self._attention.add(miner.id)
@@ -412,6 +451,8 @@ class SleepController:
     def _apply_latch(
         self, miner_id: str, to_sleep: bool, now: datetime, simulated: bool = False
     ) -> None:
+        # Either outcome answers the question a failed sleep left open.
+        self._uncertain.pop(miner_id, None)
         if to_sleep:
             self._asleep[miner_id] = now
             self._waking.pop(miner_id, None)

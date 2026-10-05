@@ -5,7 +5,7 @@ from datetime import datetime
 
 from minerwatch import api
 from minerwatch.backends import BitmainHttpBackend
-from minerwatch.models import Event, Miner, RecoverWith, State, WatchdogConfig
+from minerwatch.models import Event, Miner, RecoverWith, SleepBackend, State, WatchdogConfig
 from minerwatch.store import (
     ClockRules,
     clear_needs_attention,
@@ -23,6 +23,7 @@ IN_WINDOW_FAILURE_ACTIONS: tuple[str, ...] = (
     "skipped_needs_attention",
     "skipped_would_need_attention",
     "skipped_cooldown",
+    "skipped_asleep",
     "would_restart",
     "restart",
     "restart_failed",
@@ -63,6 +64,12 @@ MINING_EVIDENCE_ACTIONS: tuple[str, ...] = ("none",)
 #: clock every few minutes and never be restarted at all.
 DEFAULT_RECOVERY_SECONDS = 300
 
+#: How long a power-mode reading stays good. ``skipped_asleep`` starts no
+#: cooldown and consumes no restart attempt, so without a clock of its own the
+#: probe would fire on every poll — every 15s, indefinitely, against a miner's
+#: web UI.
+DEFAULT_ASLEEP_RECHECK_SECONDS = 300
+
 #: Missed polls tolerated inside a recovery run before it starts over. Silence
 #: is not evidence of hashing: without this, one lucky reading, a five-minute
 #: service outage, and one more lucky reading counted as five minutes of
@@ -98,6 +105,7 @@ class Watchdog:
         max_restarts: int = 3,
         fail_after: int = 1800,
         recovery_seconds: int = DEFAULT_RECOVERY_SECONDS,
+        asleep_recheck: int = DEFAULT_ASLEEP_RECHECK_SECONDS,
         poll_interval: int = 15,
         miners: "dict[str, Miner] | None" = None,
     ):
@@ -128,6 +136,14 @@ class Watchdog:
         #: real latch: it exists only to stop a dry run logging the same
         #: decision every poll, and it dies with the process.
         self._rehearsed_attention: set[str] = set()
+        self.asleep_recheck = max(int(asleep_recheck), 0)
+        #: miner id -> (when, asleep|None, detail). Deliberately not hydrated:
+        #: a power-mode reading taken minutes before a process restart says
+        #: nothing about the miner now.
+        self._asleep_probe: dict[str, tuple[datetime, "bool | None", str]] = {}
+        #: Miners already warned about, so the WARNING fires on the transition
+        #: into "asleep in its own window" rather than on every poll.
+        self._asleep_logged: set[str] = set()
         self._hydrate_needs_attention()
         self._hydrate_attempts()
 
@@ -268,8 +284,9 @@ class Watchdog:
           6. within cooldown     → skipped_cooldown
           7. ≥max_restarts       → needs_attention (latch set), or
                                    would_need_attention when rehearsing
-          8. dry_run             → would_restart  (deque advanced)
-          9. else                → send_restart → restart / restart_failed
+          8. asleep              → skipped_asleep (no attempt consumed)
+          9. dry_run             → would_restart  (deque advanced)
+         10. else                → send_restart → restart / restart_failed
         """
         cfg = self._resolve(miner)
 
@@ -369,15 +386,46 @@ class Watchdog:
             )
             return
 
+        # 8. Power-mode guard. A miner in software sleep is stopped on purpose,
+        #    and neither recovery mechanism can fix that: sleep mode survives a
+        #    control-board reboot, so `recover_with: auto` spends all three
+        #    attempts and latches with the miner still asleep. An S19 XP,
+        #    15 Sep 2026 - three accepted reboots, ~14 hours of production lost.
+        #
+        #    Placed after the cooldown and rate limits so this HTTP read costs
+        #    one request per real restart attempt rather than one per poll, and
+        #    before the dry-run branch so a rehearsal reports what a live run
+        #    would actually do. Only for a STOPPED miner: a slept Bitmain still
+        #    answers its cgminer API, so UNREACHABLE is a different fault and
+        #    asking its web UI would only add a timeout to every attempt.
+        if state == State.STOPPED and getattr(cfg, "check_power_mode", True):
+            asleep, detail = await self.asleep_check(miner, now)
+            if asleep:
+                if miner.id not in self._asleep_logged:
+                    self._asleep_logged.add(miner.id)
+                    logger.warning(
+                        "%s: asleep inside its own working window (%s) - not restarting. "
+                        "A reboot cannot wake a slept miner; the sleep controller has to.",
+                        miner.id, detail,
+                    )
+                self._log(
+                    miner, state, "skipped_asleep",
+                    f"miner is in software sleep ({detail}); a restart cannot fix that",
+                    now,
+                )
+                return
+            if asleep is False:
+                self._asleep_logged.discard(miner.id)
+
         now_ts = now
 
-        # 8. Dry-run
+        # 9. Dry-run
         if self.dry_run:
             dq.append(now_ts)
             self._log(miner, state, "would_restart", f"dry-run: would send restart to {miner.host}:{miner.port}", now)
             return
 
-        # 9. Actuate
+        # 10. Actuate
         ok, detail = await self.recover(miner)
         dq.append(now_ts)
         action = "restart" if ok else "restart_failed"
@@ -389,6 +437,46 @@ class Watchdog:
             int(self.failing_for(miner.id, now)),
             detail,
         )
+
+    # ------------------------------------------------------------------
+    # Power-mode guard
+    # ------------------------------------------------------------------
+
+    async def asleep_check(self, miner: Miner, now: datetime) -> "tuple[bool | None, str]":
+        """Is *miner* in software sleep? ``None`` when it cannot be determined.
+
+        Rate-limited per miner, because ``skipped_asleep`` deliberately starts
+        no cooldown and consumes no restart attempt — there is nothing else to
+        pace it, and a stuck miner would otherwise be asked every 15 seconds
+        for as long as it stayed stuck.
+
+        ``None`` is never treated as "awake" by the caller. A miner we could not
+        read is a miner we know nothing about, and the guard falls through to
+        the restart it would have sent anyway: a miner whose web UI is dead
+        still needs to be recoverable, and failing closed here would turn a
+        broken CGI into a permanent, silent no-restart.
+        """
+        cfg = self._resolve(miner)
+        recheck = int(getattr(cfg, "asleep_recheck_seconds", self.asleep_recheck))
+        cached = self._asleep_probe.get(miner.id)
+        if cached is not None and (now - cached[0]).total_seconds() < recheck:
+            return cached[1], cached[2]
+
+        backend = getattr(getattr(miner, "sleep", None), "backend", None)
+        if backend is not SleepBackend.BITMAIN_HTTP:
+            # No web UI to ask. Independent of sleep.enabled on purpose: a miner
+            # whose scheduled sleep is switched off can still have been slept by
+            # hand, and these are the same credentials `send_reboot` already
+            # borrows from the sleep block.
+            result: "tuple[bool | None, str]" = (None, "no HTTP power control configured")
+        else:
+            try:
+                result = await BitmainHttpBackend().is_asleep(miner)
+            except Exception as exc:  # pragma: no cover - defensive
+                result = (None, str(exc) or type(exc).__name__)
+
+        self._asleep_probe[miner.id] = (now, result[0], result[1])
+        return result
 
     # ------------------------------------------------------------------
     # TCP restart actuator
@@ -438,6 +526,10 @@ class Watchdog:
         web-UI username, password and port per miner, and duplicating them
         under ``watchdog:`` would create two places to get them wrong. Sleep
         does not have to be enabled for the watchdog to use them.
+
+        A reboot cannot wake a sleeping miner — the mode is persistent across
+        one — which is why :meth:`consider` checks the power mode before ever
+        reaching this.
         """
         try:
             return await BitmainHttpBackend().reboot(miner)
@@ -490,6 +582,11 @@ class Watchdog:
         """
         self._needs_attention.discard(miner_id)
         self._rehearsed_attention.discard(miner_id)
+        # Drop any cached power-mode reading too: an operator clearing a latch
+        # is usually acting on the miner at the same time, and a stale "asleep"
+        # would suppress the restart they just re-enabled.
+        self._asleep_probe.pop(miner_id, None)
+        self._asleep_logged.discard(miner_id)
         clear_needs_attention(self.conn, miner_id)
         if miner_id in self._attempts:
             self._trim_after_clear(self._attempts[miner_id], self._resolve_by_id(miner_id).max_restarts)
@@ -514,10 +611,13 @@ class Watchdog:
     #: Actions the watchdog writes on every poll of a failing miner. At a
     #: 15-second interval these would bury everything else at INFO, so they go
     #: to DEBUG - visible under `-v`, which is exactly the trace an operator
-    #: wants when asking "why has nothing been restarted?".
+    #: wants when asking "why has nothing been restarted?". `skipped_asleep`
+    #: belongs here for the same reason; the first detection of it is announced
+    #: once, at WARNING, from `consider`.
     ROUTINE_ACTIONS = frozenset({
         "waiting_to_restart",
         "skipped_cooldown",
+        "skipped_asleep",
         "skipped_outside_hours",
         "skipped_needs_attention",
         "skipped_would_need_attention",
