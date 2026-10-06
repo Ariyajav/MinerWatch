@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -140,8 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Do not send email alerts or show their settings")
     web.add_argument(
         "--allow-remote-settings", action="store_true",
-        help="Let other machines change the alert settings (default: this PC only)",
+        help="Let other machines see and change the alert settings and miners.yaml "
+             "(default: this PC only)",
     )
+    web.add_argument("--no-config-editor", action="store_true",
+                     help="Do not show or edit miners.yaml on the page")
 
     hist = sub.add_parser(
         "history",
@@ -891,8 +895,9 @@ def cmd_web(args, config, conn) -> int:
 
     poll_interval, db_path, _, miners = config
     alerts_path = None if args.no_alerts else resolve_path(args.alerts_file, args.config)
+    config_path = None if args.no_config_editor else os.path.abspath(args.config)
     return serve(args.host, args.port, db_path, miners, poll_interval, alerts_path,
-                 args.allow_remote_settings)
+                 args.allow_remote_settings, config_path)
 
 
 #: Every subcommand name, used to tell a bare config path from a subcommand.
