@@ -11,7 +11,7 @@ import pytest
 from minerwatch.cli import build_parser, _normalise_argv
 from minerwatch.models import Miner, Range, Schedule, SleepBackend, SleepConfig, Window
 from minerwatch.store import init_db
-from minerwatch.web import history, make_server, open_readonly, snapshot
+from minerwatch.web import FleetState, history, make_server, open_readonly, snapshot
 
 NOW = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -82,6 +82,35 @@ class TestSnapshot:
         snap = snapshot(conn, MINERS, 15, now=NOW)
         assert snap["stale"] is True and snap["newest_poll"] is None
         assert snap["miners"][0]["state"] == "unknown"
+
+
+class TestIncremental:
+    def test_later_rows_are_picked_up_without_a_rescan(self, db):
+        path, conn = db
+        add(conn, "m1", 30, "mining", "none", ghs=140000)
+        add(conn, "m2", 30, "mining", "sleep")
+        fleet = FleetState(MINERS)
+        first = snapshot(conn, MINERS, 15, now=NOW, fleet=fleet)
+        assert first["miners"][1]["power"] == "asleep"
+
+        add(conn, "m1", 20, "stopped", "needs_attention")
+        add(conn, "m1", 1, "stopped", "alert", "zero hashrate", ghs=0)
+        add(conn, "m2", 1, "mining", "wake")
+        later = snapshot(conn, MINERS, 15, now=NOW, fleet=fleet)
+        m1, m2 = later["miners"]
+        assert m1["state"] == "stopped" and m1["latches"] == ["watchdog"]
+        assert m2["power"] == "awake"
+        # And it agrees with a fresh full read of the same table.
+        fresh = snapshot(conn, MINERS, 15, now=NOW)
+        assert fresh["miners"] == later["miners"]
+
+    def test_a_cleared_latch_clears(self, db):
+        path, conn = db
+        add(conn, "m1", 20, "stopped", "needs_attention")
+        fleet = FleetState(MINERS)
+        assert snapshot(conn, MINERS, 15, now=NOW, fleet=fleet)["miners"][0]["latches"]
+        add(conn, "m1", 10, "unknown", "attention_cleared")
+        assert snapshot(conn, MINERS, 15, now=NOW, fleet=fleet)["miners"][0]["latches"] == []
 
 
 class TestHistory:
@@ -169,3 +198,19 @@ def test_cli_accepts_web_with_and_without_a_config_flag():
     assert args.command == "web" and args.port == 9000 and args.host == "127.0.0.1"
     args = build_parser().parse_args(_normalise_argv(["-c", "x.yaml", "web"]))
     assert args.config == "x.yaml" and args.port == 8787
+    assert args.no_config_editor is False
+    assert build_parser().parse_args(["web", "--no-config-editor"]).no_config_editor is True
+
+
+def test_an_unexpected_error_reaches_the_page_instead_of_a_dropped_connection(server, monkeypatch):
+    base, _ = server
+    import minerwatch.web as web
+
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(web, "snapshot", boom)
+    with pytest.raises(urllib.error.HTTPError) as err:
+        get(base + "/api/status")
+    assert err.value.code == 500
+    assert "RuntimeError: kaboom" in json.loads(err.value.read())["error"]

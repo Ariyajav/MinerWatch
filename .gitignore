@@ -42,3 +42,8 @@ logs/
 
 # Local patches / scratch
 *.patch
+
+# Written by `minerwatch web`
+/alerts.json
+/alerts.state.json
+/config-backups/

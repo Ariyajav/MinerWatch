@@ -154,6 +154,27 @@ gitignored. The page never sends the password back to the browser. Settings
 can only be changed from the PC running `web`, unless it is started with
 `--allow-remote-settings`. `--no-alerts` turns the feature off.
 
+### Editing the configuration
+
+Click **Configuration** on the page to edit `miners.yaml` in the browser. You
+edit the file itself, so comments, layout and group inheritance are kept.
+Every edit is checked with the same parser the supervisor uses, and **Save**
+stays disabled until the check passes. The page then lists, per miner, what
+the edit really changes after inheritance. Changes that deserve a second look
+are highlighted and need a confirmation before saving. These include sleep
+going LIVE, a recovery that reboots the control board, a miner added or
+removed, and a new address.
+
+Each save keeps the previous file in `config-backups/` beside the config (the
+newest 50), and any backup can be loaded back into the editor. A save is
+refused if the file was changed by something else since the page loaded it.
+The supervisor reads the config only when it starts, so restart the task
+after saving (see [Changing the config](#changing-the-config)).
+
+The file holds the miners' web passwords, so the editor is available only
+from the PC running `web` (opened as `http://localhost`), unless `web` is
+started with `--allow-remote-settings`. `--no-config-editor` turns it off.
+
 Equivalently `python -m minerwatch ...`. The historic form
 `python -m minerwatch miners.yaml` still works and means `run`.
 
@@ -511,8 +532,10 @@ Get-Content .\logs\minerwatch.log -Tail 20 -Wait
 
 ### Changing the config
 
-`miners.yaml` is read **once, at startup** — there is no hot reload. Edit it,
-validate with `status` (which reparses and touches no miner), then restart:
+`miners.yaml` is read **once, at startup** — there is no hot reload. Edit it
+(by hand, or on the dashboard's **Configuration** page, which validates for
+you), validate with `status` (which reparses and touches no miner), then
+restart:
 
 ```powershell
 .\.venv\Scripts\python.exe -m minerwatch -c miners.yaml status
