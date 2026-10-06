@@ -8,11 +8,13 @@ running supervisor's mind (its latches are in-memory, hydrated once at
 startup), and a web control that wrote to the events table would have exactly
 the same blind spot while looking far more authoritative.
 
-The one thing the page can write is the email alert settings file (see
-:mod:`minerwatch.alerts`). Those writes are accepted only from this PC unless
+The page can write two files: the email alert settings (see
+:mod:`minerwatch.alerts`) and ``miners.yaml`` itself (see
+:mod:`minerwatch.config_editor`). Both are accepted only from this PC unless
 ``--allow-remote-settings`` is given, and only with a custom header that a
 cross-site form cannot send, so another web page open in the same browser
-cannot quietly redirect the alerts.
+cannot quietly redirect the alerts or rewrite the fleet. The config is also
+*read* only under those rules, because it holds the miners' web passwords.
 
 The standard library is enough for a page that one operator refreshes every
 few seconds, and it keeps the Windows install to the one ``pip install`` that
@@ -21,20 +23,24 @@ already works there.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from minerwatch import alerts as alerts_mod
+from minerwatch import config_editor
+from minerwatch.config import ConfigError
 from minerwatch.compat import ALLOW_REUSE_ADDRESS
 from minerwatch.models import Miner, State
 from minerwatch.schedule import is_working_time
-from minerwatch.sleeper import SleepController
-from minerwatch.store import is_needs_attention, last_action_in, last_state
+from minerwatch.sleeper import SLEEP_ACTIONS, UNCERTAIN_ACTIONS, WAKE_ACTIONS
 
 logger = logging.getLogger("minerwatch")
 
@@ -61,62 +67,174 @@ def open_readonly(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True, timeout=30.0, check_same_thread=False)
 
 
+class FleetState:
+    """What the dashboard needs from the events table, kept up to date incrementally.
+
+    The events table has no index on ``action``, so every "latest row with
+    action X" question is a scan of that miner's whole history. ``status``
+    asks a few dozen of them and takes ~10s on six weeks of a 12-miner fleet;
+    the first version of this page asked them on every refresh, from every
+    open tab and the alert monitor at once, and on the real host never
+    answered at all.
+
+    Instead: one pass over the rare non-poll rows at startup, then on each
+    refresh only the rows added since (``id`` is the table's integer primary
+    key, so ``id > ?`` is a range read however large the table grows). The
+    supervisor's database is never written - adding the missing index would be
+    the obvious fix, but this process opens the file read-only on purpose.
+    """
+
+    def __init__(self, miners: dict[str, Miner]):
+        self.miners = miners
+        self._lock = threading.RLock()
+        self.last_id: int | None = None
+        self.poll: dict[str, tuple] = {}        # newest poll row
+        self.latest: dict[str, tuple] = {}      # newest row of any kind
+        self.decision: dict[str, tuple] = {}    # newest non-poll row
+        self.power: dict[str, str] = {}         # asleep / unsure / awake
+        self.watchdog_latch: dict[str, str | None] = {}  # ts latched, or None
+        self.sleep_latch: dict[str, str | None] = {}
+
+    # Row layout everywhere below: (id, ts, miner, state, action, reason, ghs)
+    _COLUMNS = "id, ts, miner, state, action, reason, ghs"
+
+    def replace_miners(self, miners: dict[str, Miner]) -> None:
+        """Switch to a new miner list (after the config editor saved one).
+
+        The dict is shared with the request handlers and the alert monitor,
+        so it is changed in place, and the next refresh re-reads the history
+        so a newly added miner shows its past polls.
+        """
+        with self._lock:
+            self.miners.clear()
+            self.miners.update(miners)
+            self.last_id = None
+
+    def refresh(self, conn) -> None:
+        with self._lock:
+            top = conn.execute("SELECT MAX(id) FROM events").fetchone()[0] or 0
+            if self.last_id is None or top < self.last_id:
+                self._load(conn, top)  # first call, or the file was replaced
+            elif top > self.last_id:
+                rows = conn.execute(
+                    f"SELECT {self._COLUMNS} FROM events WHERE id > ? AND id <= ? ORDER BY id",
+                    (self.last_id, top),
+                ).fetchall()
+                for row in rows:
+                    self._apply(row)
+            self.last_id = top
+
+    def _load(self, conn, top: int) -> None:
+        for name in ("poll", "latest", "decision", "power", "watchdog_latch", "sleep_latch"):
+            getattr(self, name).clear()
+        placeholders = ",".join("?" for _ in POLL_ACTIONS)
+        # The one full scan: every decision ever made, oldest first. These are a
+        # tiny fraction of the table (polls are the other 99%).
+        for row in conn.execute(
+            f"SELECT {self._COLUMNS} FROM events WHERE id <= ? AND "
+            f"(action IS NULL OR action NOT IN ({placeholders})) ORDER BY id",
+            (top, *POLL_ACTIONS),
+        ):
+            self._apply(row)
+        # The newest poll is near the end of each miner's history, so these
+        # walk the (miner, ts) index backwards and stop almost at once.
+        for miner_id in self.miners:
+            row = conn.execute(
+                f"SELECT {self._COLUMNS} FROM events WHERE miner = ? AND id <= ? "
+                f"AND action IN ({placeholders}) ORDER BY ts DESC, id DESC LIMIT 1",
+                (miner_id, top, *POLL_ACTIONS),
+            ).fetchone()
+            if row is not None:
+                self._apply(row)
+
+    def _apply(self, row: tuple) -> None:
+        _, ts, miner, state, action, _, _ = row
+        if miner not in self.latest or ts >= self.latest[miner][1]:
+            self.latest[miner] = row
+        if action in POLL_ACTIONS:
+            if miner not in self.poll or ts >= self.poll[miner][1]:
+                self.poll[miner] = row
+            return
+        if action is None:
+            return
+        self.decision[miner] = row
+        # Same rules the controllers hydrate by: the most recent of each family wins.
+        if action in SLEEP_ACTIONS:
+            self.power[miner] = "asleep"
+        elif action in UNCERTAIN_ACTIONS:
+            self.power[miner] = "unsure"
+        elif action in WAKE_ACTIONS:
+            self.power[miner] = "awake"
+        if action == "needs_attention":
+            self.watchdog_latch[miner] = ts
+        elif action == "attention_cleared":
+            self.watchdog_latch[miner] = None
+        if action == "sleep_needs_attention":
+            self.sleep_latch[miner] = ts
+        elif action in ("sleep_attention_cleared",):
+            self.sleep_latch[miner] = None
+
+
 def snapshot(conn, miners: dict[str, Miner], poll_interval: int,
-             now: datetime | None = None) -> dict:
+             now: datetime | None = None, fleet: FleetState | None = None) -> dict:
     """Everything the dashboard's main table shows, as plain JSON-able data.
 
-    Built from the same reads as ``cmd_status`` so the two can never disagree:
-    the state and hashrate come from the newest *poll* row, and the latches
-    from the same store functions the controllers hydrate from.
+    Follows ``cmd_status``: the state and hashrate come from the newest *poll*
+    row, and the latches and power mode from the same "most recent of each
+    family" rules the controllers hydrate from.
     """
     from minerwatch.cli import ACTION_MEANING, _diagnose
 
     now = now or datetime.now(timezone.utc)
-    controller = SleepController(conn, miners)
+    if fleet is None:
+        fleet = FleetState(miners)
+    with fleet._lock:  # the alert monitor refreshes the same state from its own thread
+        fleet.refresh(conn)
+        return _build_snapshot(fleet, miners, poll_interval, now)
+
+
+def _build_snapshot(fleet: FleetState, miners: dict[str, Miner], poll_interval: int,
+                    now: datetime) -> dict:
+    from minerwatch.cli import ACTION_MEANING, _diagnose
+
     rows = []
     newest_poll: datetime | None = None
     for miner in miners.values():
-        poll = last_action_in(conn, miner.id, POLL_ACTIONS)
-        last = poll or last_state(conn, miner.id)
-        decision = _last_decision(conn, miner.id, now)
-        if not miner.sleep.enabled:
-            power = "manual"
-        elif controller.is_asleep(miner.id):
-            power = "asleep"
-        elif controller.is_uncertain(miner.id):
-            power = "unsure"
-        else:
-            power = "awake"
-        latches = []
-        if is_needs_attention(conn, miner.id):
+        poll = fleet.poll.get(miner.id)
+        last = poll or fleet.latest.get(miner.id)
+        decision = fleet.decision.get(miner.id)
+        power = "manual" if not miner.sleep.enabled else fleet.power.get(miner.id, "awake")
+        latches, since = [], []
+        if fleet.watchdog_latch.get(miner.id):
             latches.append("watchdog")
-        if controller.needs_attention(miner.id):
+            since.append(fleet.watchdog_latch[miner.id])
+        if fleet.sleep_latch.get(miner.id):
             latches.append("sleep")
-        latched_since = _latched_since(conn, miner.id) if latches else None
+            since.append(fleet.sleep_latch[miner.id])
 
-        seen = _parse(last.ts) if last else None
+        seen = _parse(last[1]) if last else None
         if poll is not None:
-            polled = _parse(poll.ts)
+            polled = _parse(poll[1])
             if polled and (newest_poll is None or polled > newest_poll):
                 newest_poll = polled
 
-        reason = poll.reason if poll is not None and poll.state != State.MINING.value else None
+        reason = poll[5] if poll is not None and poll[3] != State.MINING.value else None
         rows.append({
             "id": miner.id,
             "group": miner.group,
             "host": miner.host,
-            "state": last.state if last else "unknown",
-            "ghs": poll.ghs if poll is not None else None,
+            "state": last[3] if last else "unknown",
+            "ghs": poll[6] if poll is not None else None,
             "window": "open" if is_working_time(miner, now) else "closed",
             "power": power,
             "latches": latches,
-            "latched_since": latched_since,
+            "latched_since": max(since) if since else None,
             "last_seen": seen.isoformat() if seen else None,
             "reason": reason,
             "diagnosis": _diagnose(reason) if reason else None,
             "last_decision": decision and {
-                "ts": decision[0], "action": decision[1],
-                "meaning": decision[2] or ACTION_MEANING.get(decision[1], ""),
+                "ts": decision[1], "action": decision[4],
+                "meaning": decision[5] or ACTION_MEANING.get(decision[4], ""),
             },
         })
 
@@ -175,29 +293,6 @@ def history(conn, miner_id: str, hours: float, now: datetime | None = None) -> d
     }
 
 
-def _last_decision(conn, miner_id: str, now: datetime):
-    # Bounded by time so the (miner, ts) index does the work: a monitor-only
-    # miner has never had a decision, and without the bound every refresh would
-    # scan its entire history looking for one.
-    since = (now - timedelta(days=14)).isoformat()
-    placeholders = ",".join("?" for _ in POLL_ACTIONS)
-    return conn.execute(
-        f"SELECT ts, action, reason FROM events WHERE miner = ? AND ts >= ? "
-        f"AND action IS NOT NULL AND action NOT IN ({placeholders}) "
-        f"ORDER BY ts DESC, id DESC LIMIT 1",
-        (miner_id, since, *POLL_ACTIONS),
-    ).fetchone()
-
-
-def _latched_since(conn, miner_id: str) -> str | None:
-    row = conn.execute(
-        "SELECT ts FROM events WHERE miner = ? AND action IN "
-        "('needs_attention', 'sleep_needs_attention') ORDER BY ts DESC, id DESC LIMIT 1",
-        (miner_id,),
-    ).fetchone()
-    return row[0] if row else None
-
-
 def _parse(ts: str | None) -> datetime | None:
     if not ts:
         return None
@@ -216,12 +311,19 @@ def _parse(ts: str | None) -> datetime | None:
 MAX_BODY_BYTES = 64 * 1024
 
 LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+#: Host headers a page served from this PC sends. Anything else, from a
+#: loopback client, is a DNS-rebinding page and is refused the settings.
+LOOPBACK_NAMES = ("localhost", "127.0.0.1", "[::1]")
 
 
 def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
                 poll_interval: int, alerts_path: str | None = None,
                 monitor: "alerts_mod.AlertMonitor | None" = None,
-                allow_remote_settings: bool = False) -> ThreadingHTTPServer:
+                allow_remote_settings: bool = False,
+                fleet: FleetState | None = None,
+                config_path: str | None = None) -> ThreadingHTTPServer:
+    fleet = fleet or FleetState(miners)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "MinerWatch"
 
@@ -235,7 +337,7 @@ def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
                     return self._send(204, b"", "image/x-icon")
                 if url.path == "/api/status":
                     with _closing(open_readonly(db_path)) as conn:
-                        return self._json(200, snapshot(conn, miners, poll_interval))
+                        return self._json(200, snapshot(conn, miners, poll_interval, fleet=fleet))
                 if url.path == "/api/history":
                     miner_id = (query.get("miner") or [""])[0]
                     if miner_id not in miners:
@@ -260,14 +362,34 @@ def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
                         "status": monitor.status if monitor else None,
                         "can_edit": allow_remote_settings or self._is_local(),
                     })
+                if url.path.startswith("/api/config"):
+                    return self._config_get(url.path, query)
                 return self._json(404, {"error": "not found"})
             except sqlite3.OperationalError as exc:
                 # Usually "unable to open database file": the supervisor has not
                 # created it yet, or the dashboard was pointed at the wrong config.
                 return self._json(503, {"error": f"cannot read {db_path}: {exc}"})
+            except (BrokenPipeError, ConnectionResetError):
+                return None  # the browser went away mid-reply; nothing to tell it
+            except Exception as exc:
+                # Without this the server drops the connection and the page can
+                # only say "Failed to fetch". Send the actual error to the page
+                # and the full traceback to the console.
+                logger.exception("web: %s failed", url.path)
+                return self._json(500, {"error": f"{type(exc).__name__}: {exc} "
+                                                 f"(full details in the console window)"})
 
         def do_POST(self):  # noqa: N802
             url = urlparse(self.path)
+            if url.path in ("/api/config/check", "/api/config/save"):
+                try:
+                    return self._config_post(url.path)
+                except (BrokenPipeError, ConnectionResetError):
+                    return None
+                except Exception as exc:
+                    logger.exception("web: %s failed", url.path)
+                    return self._json(500, {"error": f"{type(exc).__name__}: {exc} "
+                                                     f"(full details in the console window)"})
             if alerts_path is None or url.path not in ("/api/alerts", "/api/alerts/test"):
                 return self._json(405, {"error": "the dashboard is read-only"})
             refusal = self._refuse_write()
@@ -317,9 +439,9 @@ def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
             return self.client_address[0] in LOOPBACK
 
         def _refuse_write(self) -> str | None:
-            if not (allow_remote_settings or self._is_local()):
-                return ("settings can only be changed from the MinerWatch PC itself "
-                        "(start the dashboard with --allow-remote-settings to change that)")
+            refusal = self._refuse_remote()
+            if refusal:
+                return refusal
             # A cross-site <form> cannot set a custom header or a JSON content
             # type without a CORS preflight, which this server never approves.
             if self.headers.get("X-MinerWatch") != "1":
@@ -327,6 +449,90 @@ def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 return "expected application/json"
             return None
+
+        def _refuse_remote(self) -> str | None:
+            if allow_remote_settings:
+                return None
+            if not self._is_local():
+                return ("settings can only be changed from the MinerWatch PC itself "
+                        "(start the dashboard with --allow-remote-settings to change that)")
+            host = (self.headers.get("Host") or "").lower()
+            name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+            if name not in LOOPBACK_NAMES:
+                return f"open the dashboard as http://localhost to change settings (not {host})"
+            return None
+
+        def _read_body(self) -> dict:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > config_editor.MAX_CONFIG_BYTES + MAX_BODY_BYTES:
+                raise ValueError("request too large")
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("expected a JSON object")
+            return body
+
+        # --- miners.yaml editor ---------------------------------------------
+
+        def _config_get(self, path: str, query: dict):
+            if config_path is None:
+                return self._json(200, {"available": False})
+            refusal = self._refuse_remote()
+            if refusal:
+                return self._json(403, {"available": True, "can_edit": False, "error": refusal})
+            # Reads hand out passwords, so they need the header too: a page on
+            # another site cannot add it without a preflight this server refuses.
+            if self.headers.get("X-MinerWatch") != "1":
+                return self._json(403, {"error": "missing X-MinerWatch header"})
+            if path == "/api/config":
+                cur = config_editor.current(config_path)
+                result = config_editor.check(cur["text"], config_path)
+                return self._json(200, {"available": True, "can_edit": True, **cur,
+                                        "check": result})
+            if path == "/api/config/backups":
+                return self._json(200, {"backups": config_editor.list_backups(config_path)})
+            if path == "/api/config/backup":
+                name = (query.get("name") or [""])[0]
+                try:
+                    return self._json(200, {"name": name,
+                                            "text": config_editor.read_backup(config_path, name)})
+                except FileNotFoundError:
+                    return self._json(404, {"error": f"no backup named {name!r}"})
+            return self._json(404, {"error": "not found"})
+
+        def _config_post(self, path: str):
+            if config_path is None:
+                return self._json(404, {"error": "the config editor is not available"})
+            refusal = self._refuse_write()
+            if refusal:
+                return self._json(403, {"error": refusal})
+            try:
+                body = self._read_body()
+                text = body["text"]
+                if not isinstance(text, str):
+                    raise ValueError("text must be a string")
+            except (ValueError, KeyError, TypeError) as exc:
+                return self._json(400, {"error": f"bad request: {exc}"})
+            if path == "/api/config/check":
+                return self._json(200, config_editor.check(text, config_path))
+            try:
+                saved = config_editor.save(text, config_path, str(body.get("base_sha") or ""))
+            except ConfigError as exc:
+                return self._json(400, {"error": f"not saved, the config is not valid: {exc}"})
+            except config_editor.EditConflict as exc:
+                return self._json(409, {"error": str(exc)})
+            new_interval, new_db, _, new_miners = saved["config"]
+            fleet.replace_miners(new_miners)
+            logger.info("config: %s saved by %s (backup %s)", config_path,
+                        self.client_address[0], saved["backup"])
+            notes = []
+            if new_db != db_path:
+                notes.append("The database path changed. Restart the dashboard too, "
+                             "so it reads the same file as the supervisor.")
+            if new_interval != poll_interval:
+                notes.append("The poll interval changed. Restart the dashboard too, "
+                             "so it judges the supervisor stale on the new interval.")
+            return self._json(200, {"ok": True, "sha": saved["sha"], "backup": saved["backup"],
+                                    "warnings": saved["warnings"], "notes": notes})
 
         def _json(self, code: int, body: dict):
             self._send(code, json.dumps(body).encode("utf-8"), "application/json")
@@ -364,13 +570,30 @@ class _closing:
 
 def serve(host: str, port: int, db_path: str, miners: dict[str, Miner],
           poll_interval: int, alerts_path: str | None = None,
-          allow_remote_settings: bool = False) -> int:
+          allow_remote_settings: bool = False, config_path: str | None = None) -> int:
+    fleet = FleetState(miners)
+    # Read the history once before listening, so the first page load is not
+    # the one that waits for it - and so a slow or unreadable database shows
+    # up here, in the console, rather than as a page stuck on "loading".
+    print(f"Reading {db_path} ...", flush=True)
+    started = time.monotonic()
+    try:
+        with _closing(open_readonly(db_path)) as conn:
+            fleet.refresh(conn)
+    except sqlite3.OperationalError as exc:
+        print(f"Cannot read {db_path}: {exc}")
+        print("Is this the config the supervisor uses, and has it run at least once?")
+        return 2
+    print(f"  done in {time.monotonic() - started:.1f}s "
+          f"({len(fleet.poll)} of {len(miners)} miners have been polled)")
+
     monitor = None
     if alerts_path is not None:
         monitor = alerts_mod.AlertMonitor(alerts_path, db_path, miners, poll_interval,
-                                          snapshot, open_readonly)
+                                          functools.partial(snapshot, fleet=fleet),
+                                          open_readonly)
     server = make_server(host, port, db_path, miners, poll_interval, alerts_path,
-                         monitor, allow_remote_settings)
+                         monitor, allow_remote_settings, fleet, config_path)
     shown = "localhost" if host in ("127.0.0.1", "::1") else host
     print(f"MinerWatch dashboard on http://{shown}:{server.server_address[1]}/")
     if host not in ("127.0.0.1", "::1", "localhost"):
@@ -378,6 +601,9 @@ def serve(host: str, port: int, db_path: str, miners: dict[str, Miner],
     if monitor is not None:
         print(f"Email alerts: settings in {alerts_path} (edit them on the page).")
         monitor.start()
+    if config_path is not None:
+        print(f"Configuration: {config_path} can be edited on the page "
+              f"(backups in {config_editor.backup_dir(config_path)}).")
     print("Ctrl+C to stop. The supervisor is not affected either way.")
     try:
         server.serve_forever()
@@ -458,7 +684,26 @@ header .spacer { flex: 1; }
 .checks input[type=number] { width: 70px; padding: 3px 6px; background: var(--bg); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px; font: inherit; }
 .actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
-#amsg.ok { color: var(--ok); } #amsg.bad { color: var(--bad); }
+#amsg.ok, #cmsg.ok { color: var(--ok); } #amsg.bad, #cmsg.bad { color: var(--bad); }
+#config { margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+#config h2 { font-size: 16px; margin: 0 0 4px; }
+#config h3 { font-size: 13px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+#ctext { width: 100%; min-height: 420px; resize: vertical; margin-top: 10px; padding: 10px; tab-size: 2;
+  font: 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre; overflow: auto;
+  background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
+#ctext.dirty { border-color: var(--warn); }
+#config table { min-width: 0; }
+#config td { white-space: normal; vertical-align: top; }
+#config tbody tr { cursor: default; }
+#config tbody tr:hover { background: none; }
+#config tr.risky td { background: var(--warnbg); }
+#config tr.risky td.why { color: var(--warn); font-weight: 600; }
+#config pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+  overflow: auto; max-height: 360px; font: 12px/1.45 ui-monospace, Consolas, monospace; margin: 6px 0; }
+#config pre .add { color: var(--ok); } #config pre .del { color: var(--bad); }
+#config details { margin-top: 10px; } #config summary { cursor: pointer; color: var(--muted); }
+#crestart { white-space: normal; }
+#crestart code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -467,9 +712,32 @@ header .spacer { flex: 1; }
   <span class="muted" id="updated">loading…</span>
   <span class="muted">refreshes every 15s</span>
   <span class="spacer"></span>
+  <button id="configBtn" hidden>Configuration</button>
   <button id="alertsBtn" hidden>Email alerts</button>
 </header>
 <main>
+  <section id="config" hidden>
+    <h2>Configuration</h2>
+    <div class="muted" id="cpath"></div>
+    <div id="cview"></div>
+    <div id="ceditor" hidden>
+      <div class="muted">This is the file itself, comments and all. Changes are checked with the same
+        rules the supervisor uses before they can be saved, the old file is kept as a backup, and they
+        take effect when the MinerWatch task is restarted.</div>
+      <textarea id="ctext" spellcheck="false" autocomplete="off" aria-label="miners.yaml"></textarea>
+      <div class="actions">
+        <button class="btn" type="button" id="ccheck">Check</button>
+        <button class="btn primary" type="button" id="csave" disabled>Save</button>
+        <button class="btn" type="button" id="crevert">Discard edits</button>
+        <span class="spacer" style="flex:1"></span>
+        <select id="cbackups" aria-label="backups"><option value="">Backups…</option></select>
+        <button class="btn" type="button" id="cload" disabled>Load into editor</button>
+      </div>
+      <div id="cmsg" style="margin-top:8px"></div>
+      <div id="crestart" class="banner warn" hidden></div>
+      <div id="cresult"></div>
+    </div>
+  </section>
   <section id="alerts" hidden>
     <h2>Email alerts</h2>
     <div class="muted" id="astatus"></div>
@@ -556,15 +824,32 @@ function ago(ts) {
 function pill(text, cls) { return `<span class="pill ${cls}">${esc(text)}</span>`; }
 function stateCls(s) { return ["mining","stopped","unreachable"].includes(s) ? s : "other"; }
 
+let refreshing = false;
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try { await doRefresh(); } finally { refreshing = false; }
+}
+
+async function doRefresh() {
   let data;
+  // Never sit on "loading" silently: say so if the server is slow, and give up
+  // with a reason rather than waiting forever.
+  const slow = setTimeout(() => {
+    $("banners").innerHTML = `<div class="banner warn">Still waiting for the dashboard data. Check the window running "minerwatch web" for errors.</div>`;
+  }, 8000);
+  const abort = new AbortController();
+  const giveUp = setTimeout(() => abort.abort(), 60000);
   try {
-    const r = await fetch("api/status", {cache: "no-store"});
+    const r = await fetch("api/status", {cache: "no-store", signal: abort.signal});
     data = await r.json();
     if (!r.ok) throw new Error(data.error || r.status);
   } catch (e) {
-    $("banners").innerHTML = `<div class="banner bad">Cannot read the dashboard data: ${esc(e.message)}</div>`;
+    const why = e.name === "AbortError" ? "no answer from the server after 60s" : e.message;
+    $("banners").innerHTML = `<div class="banner bad">Cannot read the dashboard data: ${esc(why)}</div>`;
     return;
+  } finally {
+    clearTimeout(slow); clearTimeout(giveUp);
   }
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   const banners = [];
@@ -703,8 +988,157 @@ $("alertsBtn").onclick = () => {
   if (!sec.hidden) loadAlerts(true);
 };
 
+// ---- configuration editor ----------------------------------------------
+const ctext = $("ctext");
+let cfg = {sha: null, saved: "", checkedText: null, checkOk: false, risky: []};
+let checkTimer = null, checkSeq = 0;
+
+async function getJson(path) {
+  const r = await fetch(path, {cache: "no-store", headers: {"X-MinerWatch": "1"}});
+  const data = await r.json();
+  if (!r.ok) { const e = new Error(data.error || r.status); e.data = data; throw e; }
+  return data;
+}
+function csay(text, ok) { $("cmsg").textContent = text; $("cmsg").className = ok ? "ok" : "bad"; }
+function dirty() { return ctext.value !== cfg.saved; }
+function setSaveState() {
+  ctext.classList.toggle("dirty", dirty());
+  $("csave").disabled = !(dirty() && cfg.checkOk && cfg.checkedText === ctext.value);
+}
+
+async function probeConfig() {
+  try { const d = await getJson("api/config"); if (d.available) $("configBtn").hidden = false; }
+  catch (e) { if (e.data && e.data.available) $("configBtn").hidden = false; }
+}
+
+async function loadConfig() {
+  let d;
+  try { d = await getJson("api/config"); }
+  catch (e) {
+    $("cpath").textContent = "";
+    $("ceditor").hidden = true;
+    $("cview").innerHTML = `<div class="banner warn">${esc(e.message)}</div>`;
+    return;
+  }
+  $("cview").innerHTML = "";
+  $("ceditor").hidden = false;
+  $("cpath").textContent = d.path;
+  cfg.sha = d.sha; cfg.saved = d.text;
+  ctext.value = d.text;
+  showCheck(d.check, d.text);
+  csay("", true);
+  loadBackups();
+}
+
+async function loadBackups() {
+  try {
+    const d = await getJson("api/config/backups");
+    $("cbackups").innerHTML = `<option value="">Backups (${d.backups.length})…</option>` +
+      d.backups.map(b => `<option value="${esc(b.name)}">${esc(when(b.saved))} · ${esc(b.name)}</option>`).join("");
+  } catch (e) { /* the editor still works without the list */ }
+  $("cload").disabled = true;
+}
+$("cbackups").onchange = () => { $("cload").disabled = !$("cbackups").value; };
+$("cload").onclick = async () => {
+  const name = $("cbackups").value;
+  if (!name) return;
+  if (dirty() && !confirm("Replace your unsaved edits with this backup?")) return;
+  try {
+    const d = await getJson("api/config/backup?name=" + encodeURIComponent(name));
+    ctext.value = d.text;
+    csay(`Loaded ${name} into the editor. It is not saved until you check and save it.`, true);
+    runCheck();
+  } catch (e) { csay(e.message, false); }
+};
+
+function showCheck(c, text) {
+  cfg.checkedText = text; cfg.checkOk = c.ok;
+  cfg.risky = (c.changes || []).filter(x => x.risky);
+  const out = [];
+  for (const e of c.errors) out.push(`<div class="banner bad"><b>Cannot be saved:</b> ${esc(e)}</div>`);
+  for (const w of c.warnings) out.push(`<div class="banner warn">${esc(w)}</div>`);
+  if (c.ok && text !== cfg.saved) {
+    out.push(`<h3>What changes${cfg.risky.length ? ` · ${cfg.risky.length} to double-check` : ""}</h3>`);
+    out.push(c.changes.length ? `<div class="wrap"><table><thead><tr><th>Miner</th><th>Setting</th><th>Before</th><th>After</th><th>Note</th></tr></thead><tbody>` +
+      c.changes.map(x => `<tr class="${x.risky ? "risky" : ""}"><td><b>${esc(x.miner)}</b></td><td>${esc(x.field)}</td><td>${esc(x.before)}</td><td>${esc(x.after)}</td><td class="why">${esc(x.why)}</td></tr>`).join("") +
+      `</tbody></table></div>` : `<div class="muted">No setting changes after inheritance (comments or layout only).</div>`);
+  }
+  if (c.ok) {
+    out.push(`<details${text === cfg.saved ? " open" : ""}><summary>Each miner's resolved settings (${c.miners.length})</summary><div class="wrap" style="margin-top:6px"><table><thead><tr><th>Miner</th><th>Group</th><th>Address</th><th>Running hours</th><th>Sleep</th><th>Restart</th></tr></thead><tbody>` +
+      c.miners.map(m => `<tr><td><b>${esc(m.id)}</b></td><td>${esc(m.group || "–")}</td><td>${esc(m.address)}</td><td>${esc(m["running hours"])}</td><td>${m.live_sleep ? pill(m.sleep, "other") : esc(m.sleep)}</td><td>${esc(m.restart)}</td></tr>`).join("") +
+      `</tbody></table></div></details>`);
+  }
+  if (c.diff) {
+    const lines = c.diff.split("\n").map(l => {
+      const cls = l.startsWith("+") && !l.startsWith("+++") ? "add" : l.startsWith("-") && !l.startsWith("---") ? "del" : "";
+      return cls ? `<span class="${cls}">${esc(l)}</span>` : esc(l);
+    });
+    out.push(`<details><summary>Line-by-line difference from the saved file</summary><pre>${lines.join("\n")}</pre></details>`);
+  }
+  $("cresult").innerHTML = out.join("");
+  setSaveState();
+}
+
+async function runCheck() {
+  clearTimeout(checkTimer);
+  const text = ctext.value, seq = ++checkSeq;
+  try {
+    const c = await post("api/config/check", {text});
+    if (seq !== checkSeq) return;  // a newer edit is already being checked
+    showCheck(c, text);
+    if (text === ctext.value && dirty()) csay(c.ok ? "Valid. Review the changes below, then save." : "", true);
+  } catch (e) { if (seq === checkSeq) csay(e.message, false); }
+}
+$("ccheck").onclick = runCheck;
+ctext.addEventListener("input", () => {
+  setSaveState();
+  clearTimeout(checkTimer);
+  checkTimer = setTimeout(runCheck, 700);
+});
+ctext.addEventListener("keydown", (e) => {
+  if (e.key === "Tab" && !e.shiftKey) {  // YAML forbids tabs: indent with spaces
+    e.preventDefault();
+    document.execCommand("insertText", false, "  ");
+  }
+});
+
+$("csave").onclick = async () => {
+  const text = ctext.value;
+  if (text !== cfg.checkedText || !cfg.checkOk) return;
+  if (cfg.risky.length && !confirm("These changes need a second look:\n\n" +
+      cfg.risky.map(x => `• ${x.miner} ${x.field}: ${x.why}`).join("\n") + "\n\nSave anyway?")) return;
+  $("csave").disabled = true;
+  try {
+    const d = await post("api/config/save", {text, base_sha: cfg.sha});
+    cfg.sha = d.sha; cfg.saved = text;
+    csay(`Saved${d.backup ? `. The previous version is kept as ${d.backup}` : ""}.`, true);
+    $("crestart").hidden = false;
+    $("crestart").innerHTML = `<b>Not in effect yet.</b> The supervisor reads the file only when it starts. ` +
+      `Restart it from an administrator PowerShell with <code>Stop-ScheduledTask -TaskName MinerWatch; Start-ScheduledTask -TaskName MinerWatch</code> ` +
+      `(or End, then Run, in Task Scheduler). The dashboard already shows the new miner list.` +
+      d.notes.map(n => `<div>${esc(n)}</div>`).join("");
+    runCheck();
+    loadBackups();
+    refresh();
+  } catch (e) { csay(e.message, false); setSaveState(); }
+};
+$("crevert").onclick = () => {
+  if (dirty() && !confirm("Discard your edits and reload the saved file?")) return;
+  loadConfig();
+};
+$("configBtn").onclick = () => {
+  const sec = $("config");
+  if (!sec.hidden && dirty() && !confirm("Close the editor? Your unsaved edits stay until you reload the page.")) return;
+  sec.hidden = !sec.hidden;
+  if (!sec.hidden && !dirty()) loadConfig();
+};
+window.addEventListener("beforeunload", (e) => {
+  if (!$("config").hidden && dirty()) { e.preventDefault(); e.returnValue = ""; }
+});
+
 refresh();
 loadAlerts(false);
+probeConfig();
 setInterval(() => { refresh(); if (!$("alerts").hidden) loadAlerts(false); }, 15000);
 </script>
 </body>
