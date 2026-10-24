@@ -119,6 +119,9 @@ minerwatch -c miners.yaml history all --decisions --hours 24
 minerwatch -c miners.yaml sleep miner-01 --live
 minerwatch -c miners.yaml wake  all   --live
 minerwatch -c miners.yaml clear-attention miner-01
+minerwatch -c miners.yaml maintenance start --for 2h --group hall-b   # power work: hands off
+minerwatch -c miners.yaml maintenance            # list scheduled and hand-started windows
+minerwatch -c miners.yaml maintenance stop       # end hand-started windows now
 minerwatch -c miners.yaml web                 # read-only dashboard on http://localhost:8787/
 ```
 
@@ -127,6 +130,43 @@ it can run alongside the supervisor and cannot change a miner or the database.
 It listens on this PC only; pass `--host 0.0.0.0` to open it to the network
 (there is no login, so only do that on a network you trust) and `--port` to
 move it.
+
+### Power maintenance windows
+
+While the power supply is being worked on, every miner on it stops and drops
+off the network. Without a maintenance window the watchdog treats that as a
+failure, spends its restarts on miners that have no power and latches them, and
+the dashboard emails about all of it. Inside a window MinerWatch still polls and
+records each miner it covers (the rows read `maintenance` in `history`), but:
+
+- sends no restart, sleep or wake, and sets no latch;
+- emails no alert about those miners (nor "supervisor not polling" when the
+  window covers the whole fleet, in case the PC goes down with it);
+- starts the restart clock again when the window ends, so a miner still booting
+  gets the full `fail_after_seconds` before anything is sent to it.
+
+Planned work goes in `miners.yaml`, either one-off or weekly, for the whole
+fleet or for named `groups` and `miners` (see `miners.example.yaml`):
+
+```yaml
+maintenance:
+  - name: hall-b PSU replacement
+    groups: [hall-b]
+    start: 2026-11-02 09:00      # default_timezone unless the entry sets timezone:
+    end: 2026-11-02 13:00
+  - name: monthly PSU inspection
+    days: [sun]
+    ranges: ["02:00-03:30"]
+```
+
+Like the rest of the file, these are read when the supervisor starts. For
+unplanned work, start a window by hand from the CLI or from the dashboard's
+**Maintenance** button. `--for 90m`, `--until "2026-11-02 13:00"` or
+`--until-stopped` is required, so a window is never left open by accident.
+Hand-started windows are kept in `maintenance.json` beside the config, which the
+supervisor re-reads whenever it changes, so starting or ending one takes effect
+on the next poll **without restarting the supervisor**. `status` and the
+dashboard show every active window.
 
 ### Email alerts
 

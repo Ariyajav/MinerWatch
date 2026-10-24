@@ -540,6 +540,15 @@ def load_config(path: str) -> tuple[int, str, str, dict[str, Miner]]:
         )
         miners[mid] = miner
 
+    # Parsed after the miners so that every group and miner a window names can
+    # be checked: a misspelt farm would otherwise be covered by nothing.
+    from minerwatch.maintenance import parse_config as _parse_maintenance
+
+    windows = _parse_maintenance(raw.get("maintenance"), default_tz, groups, miners)
+    if windows:
+        for mid, miner in miners.items():
+            miners[mid] = replace(miner, maintenance=tuple(w for w in windows if w.covers(miner)))
+
     for note in lint_miners(miners):
         logger.warning("%s", note)
 

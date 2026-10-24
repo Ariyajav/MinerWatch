@@ -172,6 +172,7 @@ def _facts(m: Miner) -> dict:
         "running hours": "; ".join(hours) + (f" ({tz})" if tz else ""),
         "sleep": _sleep_text(m),
         "restart": _fmt_watchdog(m),
+        "maintenance": "; ".join(f"{w.name} ({w.when_text()})" for w in m.maintenance) or "none",
     }
 
 
@@ -212,6 +213,8 @@ def _risk(field: str, old: Miner | None, new: Miner | None) -> str | None:
         return "changes when this miner is put to sleep"
     if field == "address":
         return "polls a different device"
+    if field == "maintenance" and new.maintenance:
+        return "no restarts, sleep/wake or alerts for this miner during these windows"
     return None
 
 

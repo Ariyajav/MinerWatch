@@ -170,3 +170,28 @@ miners:
   #   group: hall-a
   #   sleep:
   #     enabled: false     # never touch this one
+
+# ---------------------------------------------------------------------------
+# Power maintenance windows
+# ---------------------------------------------------------------------------
+# While the power supply is being worked on, every miner on it stops and
+# vanishes, and the watchdog would spend its restarts on them and latch the
+# lot. Inside a window MinerWatch still polls and records each miner, but sends
+# no restart, sleep or wake, sets no latch and emails no alert about it. The
+# restart clock starts again when the window ends, so a miner still booting
+# gets the full fail_after_seconds before anything is sent to it.
+#
+# Leave out groups and miners to cover the whole fleet. Times without an offset
+# are in default_timezone (or the entry's own timezone). Windows here are read
+# when the supervisor starts; for unplanned work use
+#   python -m minerwatch -c miners.yaml maintenance start --for 2h [--group hall-a]
+# or the Maintenance button on the dashboard, which take effect on the next
+# poll without a restart.
+# maintenance:
+#   - name: hall-b PSU replacement        # one-off
+#     groups: [hall-b]
+#     start: 2026-11-02 09:00
+#     end: 2026-11-02 13:00
+#   - name: monthly PSU inspection        # every week, same syntax as a schedule
+#     days: [sun]
+#     ranges: ["02:00-03:30"]

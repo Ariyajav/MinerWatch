@@ -41,10 +41,15 @@ IN_WINDOW_FAILURE_ACTIONS: tuple[str, ...] = (
 #: packet at 17:59 kept ticking through a twelve-hour overnight shutdown and the
 #: whole fleet — which shares a window — was restarted mid-spin-up the next
 #: morning.
+#:
+#: ``maintenance`` is the poller's record of a reading inside a power
+#: maintenance window. Clearing on it means a miner still down when the window
+#: ends gets the full ``fail_after_seconds`` to boot before it is restarted.
 CLOCK_RESET_ACTIONS: tuple[str, ...] = (
     "skipped_outside_hours",
     "skipped_watchdog_disabled",
     "expected_off",
+    "maintenance",
 )
 
 #: Poller actions that prove the miner is NOT hashing without themselves being
