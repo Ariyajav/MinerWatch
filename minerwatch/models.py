@@ -197,6 +197,10 @@ class Miner:
     #: one-off script) should not silently override a Watchdog constructed with
     #: explicit arguments.
     watchdog: Optional[WatchdogConfig] = None
+    #: Power maintenance windows from the config that cover this miner
+    #: (:class:`minerwatch.maintenance.MaintenanceWindow`). Inside one,
+    #: nothing is sent to the miner and nothing alerts on it.
+    maintenance: tuple = ()
 
 
 @dataclass

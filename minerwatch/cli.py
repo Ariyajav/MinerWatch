@@ -12,6 +12,9 @@ Subcommands:
     it is asleep or latched for attention.
 ``clear-attention``
     Release a watchdog or sleep failure latch.
+``maintenance``
+    List, start or stop power maintenance windows, during which MinerWatch
+    records what it sees but sends nothing and alerts on nothing.
 
 Everything defaults to a rehearsal: no restart and no sleep command reaches a
 miner unless ``--live`` (or the config's ``dry_run: false``) says so.
@@ -28,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Event
+from zoneinfo import ZoneInfo
 
 from minerwatch.compat import (
     TimezoneDataMissing,
@@ -37,6 +41,7 @@ from minerwatch.compat import (
 )
 from minerwatch.config import ConfigError, lint_miners, load_config
 from minerwatch.backends import get_backend
+from minerwatch import maintenance as maint
 from minerwatch.models import RecoverWith, SleepBackend, State
 from minerwatch.poller import Poller
 from minerwatch.schedule import is_working_time
@@ -121,6 +126,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     clear = sub.add_parser("clear-attention", help="Release a failure latch")
     clear.add_argument("miner", help="Miner id")
+
+    mnt = sub.add_parser(
+        "maintenance",
+        help="Power maintenance windows: no restarts, sleep/wake, latches or alerts",
+    )
+    mnt_sub = mnt.add_subparsers(dest="maintenance_command")
+    mnt_sub.add_parser("list", help="Show scheduled and hand-started windows (the default)")
+    start = mnt_sub.add_parser(
+        "start", help="Start a window now. Takes effect on the supervisor's next poll.",
+    )
+    start.add_argument("--group", action="append", default=[], metavar="GROUP",
+                       help="Only this group (farm). Repeat for several. "
+                            "Default: the whole fleet")
+    start.add_argument("--miner", action="append", default=[], metavar="ID",
+                       help="Only this miner. Repeat for several")
+    length = start.add_mutually_exclusive_group(required=True)
+    length.add_argument("--for", dest="duration", metavar="DURATION",
+                        help="How long, e.g. 90m, 2h or 1h30m")
+    length.add_argument("--until", metavar="TIME",
+                        help="End time, e.g. '2026-10-26 13:00' (default_timezone)")
+    length.add_argument("--until-stopped", action="store_true",
+                        help="No end time: runs until 'maintenance stop'")
+    start.add_argument("--name", default="", help="Short name shown in the log and dashboard")
+    start.add_argument("--reason", default="", help="Free-text note")
+    stop = mnt_sub.add_parser("stop", help="End a hand-started window now")
+    stop.add_argument("id", nargs="?", help="Window id from 'maintenance list' "
+                                            "(default: every active hand-started window)")
 
     web = sub.add_parser(
         "web",
@@ -253,7 +285,14 @@ def cmd_run(args, config, conn) -> int:
         if live:
             logger.warning("Sleep is LIVE for: %s", ", ".join(live))
 
-    poller = Poller(config, conn, stop_event, dry_run=watchdog_dry, sleep_dry_run=sleep_dry)
+    manual_file = maint.manual_path(args.config)
+    windows = maint.all_windows(miners)
+    logger.info(
+        "Maintenance: %d scheduled window(s) in the config; hand-started ones are read from %s",
+        len(windows), manual_file,
+    )
+    poller = Poller(config, conn, stop_event, dry_run=watchdog_dry, sleep_dry_run=sleep_dry,
+                    maintenance_path=manual_file)
 
     async def _main() -> None:
         if args.once:
@@ -297,7 +336,7 @@ def cmd_power(args, config, conn, to_sleep: bool) -> int:
 
 #: Actions written by the poller itself, as opposed to the watchdog or the
 #: sleep controller. Only these carry the connection error.
-POLL_ACTIONS = ("none", "alert", "expected_off")
+POLL_ACTIONS = ("none", "alert", "expected_off", "maintenance")
 
 
 def _fmt_hashrate(event) -> str:
@@ -322,6 +361,7 @@ def cmd_status(args, config, conn) -> int:
     _, _, _, miners = config
     controller = SleepController(conn, miners)
     now = datetime.now(timezone.utc)
+    manual = _manual_windows(args)
 
     problems: list[tuple] = []
     # Widen the id column to fit the fleet rather than truncating or wrapping.
@@ -347,6 +387,8 @@ def cmd_status(args, config, conn) -> int:
         state = last.state if last else "unknown"
         seen = last.ts if last else "never"
         window = "open" if is_working_time(miner, now) else "closed"
+        if maint.active_for(miner, now, manual) is not None:
+            window = "maint"
         if not miner.sleep.enabled:
             power = "manual"
         elif controller.is_asleep(miner.id):
@@ -362,8 +404,16 @@ def cmd_status(args, config, conn) -> int:
             f"{miner.id:<{w}} {state:<12} {_fmt_hashrate(poll):>11} {window:<8} "
             f"{power:<10} {(','.join(flags) or '-'):<10} {seen}"
         )
-        if poll is not None and poll.reason and poll.state != State.MINING.value:
+        if (poll is not None and poll.reason and poll.state != State.MINING.value
+                and poll.action != maint.MAINTENANCE_ACTION):
             problems.append((miner, poll.reason))
+
+    active = [w for w in maint.all_windows(miners, manual) if w.active(now)]
+    if active:
+        print()
+        print("MAINTENANCE (nothing is sent to these miners and nothing alerts on them):")
+        for w in active:
+            print(f"  {_fmt_window(w)}")
 
     # The reason is the whole diagnosis for an unreachable miner, and it was
     # previously only visible by querying the database by hand. Group identical
@@ -590,6 +640,15 @@ def cmd_config(args, config, conn) -> int:
         print("      A miner with no schedule is never inside working hours, so")
         print("      automatic sleep never applies to it.")
 
+    windows = maint.all_windows(miners)
+    if windows:
+        print()
+        print("MAINTENANCE windows (no restarts, sleep/wake, latches or alerts):")
+        for w in windows:
+            covered = [m.id for m in miners.values() if w.covers(m)]
+            print(f"  {_fmt_window(w)}")
+            print(f"      covers {len(covered)} miner(s): {', '.join(covered)}")
+
     for note in lint_miners(miners):
         print()
         print(f"PROBLEM: {note}")
@@ -758,6 +817,7 @@ ACTION_MEANING = {
     "none": "mining normally",
     "alert": "not mining, inside its window",
     "expected_off": "not mining, outside its window",
+    "maintenance": "not mining, during power maintenance - nothing sent, no alert",
     "sleep": "SENT a sleep",
     "wake": "SENT a wake",
     "would_sleep": "rehearsed a sleep - nothing sent",
@@ -889,6 +949,100 @@ def cmd_clear_attention(args, config, conn) -> int:
     return 0
 
 
+def _who() -> str:
+    user = os.environ.get("USERNAME") or os.environ.get("USER")
+    return f"cli ({user})" if user else "cli"
+
+
+def _manual_windows(args) -> list:
+    try:
+        return maint.load_manual(maint.manual_path(args.config))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"warning: {maint.manual_path(args.config)} could not be read: {exc}",
+              file=sys.stderr)
+        return []
+
+
+def _fmt_window(w) -> str:
+    ident = f"[{w.id}] " if w.id else ""
+    origin = "hand-started" if w.source == "manual" else "miners.yaml"
+    line = f"{ident}{w.name} - {w.scope_text()} - {w.when_text()} ({origin})"
+    if w.reason:
+        line += f" - {w.reason}"
+    return line
+
+
+def cmd_maintenance(args, config, conn) -> int:
+    """List, start or stop maintenance windows.
+
+    Hand-started windows live in maintenance.json beside the config, which the
+    supervisor re-reads whenever it changes - so unlike clear-attention, these
+    reach the running process on its next poll, no restart needed.
+    """
+    _, _, default_tz, miners = config
+    path = maint.manual_path(args.config)
+    now = datetime.now(timezone.utc)
+    command = getattr(args, "maintenance_command", None) or "list"
+
+    if command == "start":
+        try:
+            duration = maint.parse_duration(args.duration) if args.duration else None
+            until = None
+            if args.until:
+                until = maint.parse_datetime(args.until, ZoneInfo(default_tz), "--until")
+            window = maint.start_manual(
+                path, miners=miners, groups=args.group, miner_ids=args.miner,
+                duration=duration, until=until, name=args.name, reason=args.reason,
+                started_by=_who(),
+                now=now,
+            )
+        except (ValueError, ConfigError) as exc:
+            print(f"Not started: {exc}", file=sys.stderr)
+            return 2
+        covered = [m.id for m in miners.values() if window.covers(m)]
+        print(f"Maintenance started: {_fmt_window(window)}")
+        print(f"  covers {len(covered)} miner(s): {', '.join(covered)}")
+        print("  The running supervisor picks this up on its next poll; no restart needed.")
+        print(f"  End it early with: minerwatch maintenance stop {window.id}")
+        return 0
+
+    if command == "stop":
+        try:
+            stopped = maint.stop_manual(path, args.id, now=now)
+        except ValueError as exc:
+            print(f"Not stopped: {exc}", file=sys.stderr)
+            return 2
+        if not stopped:
+            print("No hand-started maintenance is active.")
+        for w in stopped:
+            print(f"Maintenance ended: [{w.id}] {w.name} - monitoring resumes on the next poll.")
+        still = [w for w in maint.all_windows(miners) if w.active(now)]
+        for w in still:
+            print(f"Still active from miners.yaml (edit the file and restart to change): "
+                  f"{_fmt_window(w)}")
+        return 0
+
+    manual = _manual_windows(args)
+    windows = maint.all_windows(miners, manual)
+    if not windows:
+        print("No maintenance windows. Add a 'maintenance:' list to miners.yaml, or run")
+        print("  minerwatch maintenance start --for 2h [--group FARM]")
+        return 0
+    for title, pick in (
+        ("ACTIVE NOW", lambda w: w.active(now)),
+        ("SCHEDULED", lambda w: not w.active(now) and (w.recurring or (w.end or now) > now)),
+        ("ENDED (last 7 days)", lambda w: not w.recurring and w.end is not None and w.end <= now),
+    ):
+        rows = [w for w in windows if pick(w)]
+        if rows:
+            print(title)
+            for w in rows:
+                print(f"  {_fmt_window(w)}")
+    print()
+    print(f"Hand-started windows are kept in {path}.")
+    return 0
+
+
 def cmd_web(args, config, conn) -> int:
     """Serve the dashboard. It opens its own read-only connections per request."""
     from minerwatch.web import serve
@@ -897,12 +1051,13 @@ def cmd_web(args, config, conn) -> int:
     alerts_path = None if args.no_alerts else resolve_path(args.alerts_file, args.config)
     config_path = None if args.no_config_editor else os.path.abspath(args.config)
     return serve(args.host, args.port, db_path, miners, poll_interval, alerts_path,
-                 args.allow_remote_settings, config_path)
+                 args.allow_remote_settings, config_path,
+                 maintenance_path=maint.manual_path(args.config))
 
 
 #: Every subcommand name, used to tell a bare config path from a subcommand.
 _COMMANDS = ("run", "sleep", "wake", "status", "config", "check", "diagnose",
-             "clear-attention", "history", "web")
+             "clear-attention", "history", "web", "maintenance")
 
 
 def _normalise_argv(argv: list[str] | None) -> list[str]:
@@ -968,6 +1123,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_history(args, config, conn)
         if args.command == "web":
             return cmd_web(args, config, conn)
+        if args.command == "maintenance":
+            return cmd_maintenance(args, config, conn)
         parser.print_help()
         return 2
     finally:

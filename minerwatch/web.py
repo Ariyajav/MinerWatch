@@ -8,9 +8,12 @@ running supervisor's mind (its latches are in-memory, hydrated once at
 startup), and a web control that wrote to the events table would have exactly
 the same blind spot while looking far more authoritative.
 
-The page can write two files: the email alert settings (see
-:mod:`minerwatch.alerts`) and ``miners.yaml`` itself (see
-:mod:`minerwatch.config_editor`). Both are accepted only from this PC unless
+The page can write three files: the email alert settings (see
+:mod:`minerwatch.alerts`), ``miners.yaml`` itself (see
+:mod:`minerwatch.config_editor`) and the hand-started power maintenance
+windows (see :mod:`minerwatch.maintenance`). The last is the one control that
+does reach the running supervisor, because it re-reads that file whenever it
+changes rather than once at startup. All are accepted only from this PC unless
 ``--allow-remote-settings`` is given, and only with a custom header that a
 cross-site form cannot send, so another web page open in the same browser
 cannot quietly redirect the alerts or rewrite the fleet. The config is also
@@ -36,6 +39,7 @@ from urllib.parse import parse_qs, urlparse
 
 from minerwatch import alerts as alerts_mod
 from minerwatch import config_editor
+from minerwatch import maintenance as maint
 from minerwatch.config import ConfigError
 from minerwatch.compat import ALLOW_REUSE_ADDRESS
 from minerwatch.models import Miner, State
@@ -47,7 +51,7 @@ logger = logging.getLogger("minerwatch")
 #: Poller actions: the only rows that record an *observation* of the miner.
 #: Mirrors ``cli.POLL_ACTIONS``; duplicated rather than imported so the CLI
 #: can import this module lazily without a cycle.
-POLL_ACTIONS = ("none", "alert", "expected_off")
+POLL_ACTIONS = ("none", "alert", "expected_off", "maintenance")
 
 #: Most hashrate points sent for one chart. A day of 15s polls is ~5800 rows;
 #: a sparkline a few hundred pixels wide cannot show more than this anyway.
@@ -84,8 +88,10 @@ class FleetState:
     the obvious fix, but this process opens the file read-only on purpose.
     """
 
-    def __init__(self, miners: dict[str, Miner]):
+    def __init__(self, miners: dict[str, Miner], maintenance_path: str | None = None):
         self.miners = miners
+        self.maintenance_path = maintenance_path
+        self.manual_maintenance = maint.ManualWindows(maintenance_path)
         self._lock = threading.RLock()
         self.last_id: int | None = None
         self.poll: dict[str, tuple] = {}        # newest poll row
@@ -199,7 +205,9 @@ def _build_snapshot(fleet: FleetState, miners: dict[str, Miner], poll_interval: 
 
     rows = []
     newest_poll: datetime | None = None
+    manual = fleet.manual_maintenance.get()
     for miner in miners.values():
+        in_maintenance = maint.active_for(miner, now, manual)
         poll = fleet.poll.get(miner.id)
         last = poll or fleet.latest.get(miner.id)
         decision = fleet.decision.get(miner.id)
@@ -232,6 +240,11 @@ def _build_snapshot(fleet: FleetState, miners: dict[str, Miner], poll_interval: 
             "last_seen": seen.isoformat() if seen else None,
             "reason": reason,
             "diagnosis": _diagnose(reason) if reason else None,
+            "maintenance": in_maintenance and {
+                "name": in_maintenance.name, "id": in_maintenance.id,
+                "source": in_maintenance.source,
+                "end": in_maintenance.end.isoformat() if in_maintenance.end else None,
+            },
             "last_decision": decision and {
                 "ts": decision[1], "action": decision[4],
                 "meaning": decision[5] or ACTION_MEANING.get(decision[4], ""),
@@ -251,6 +264,12 @@ def _build_snapshot(fleet: FleetState, miners: dict[str, Miner], poll_interval: 
         "stale": poll_age is None or poll_age > stale_after,
         "poll_age_seconds": poll_age,
         "miners": rows,
+        "maintenance": [w.to_public(now) for w in maint.all_windows(miners, manual)
+                        if w.recurring or w.end is None or now - w.end < maint.KEEP_ENDED],
+        "maintenance_error": fleet.manual_maintenance.error,
+        "maintenance_editable": fleet.maintenance_path is not None,
+        "fleet_maintenance": bool(rows) and all(r["maintenance"] for r in rows),
+        "groups": sorted({m.group for m in miners.values() if m.group}),
     }
 
 
@@ -381,6 +400,15 @@ def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
 
         def do_POST(self):  # noqa: N802
             url = urlparse(self.path)
+            if url.path in ("/api/maintenance/start", "/api/maintenance/stop"):
+                try:
+                    return self._maintenance_post(url.path)
+                except (BrokenPipeError, ConnectionResetError):
+                    return None
+                except Exception as exc:
+                    logger.exception("web: %s failed", url.path)
+                    return self._json(500, {"error": f"{type(exc).__name__}: {exc} "
+                                                     f"(full details in the console window)"})
             if url.path in ("/api/config/check", "/api/config/save"):
                 try:
                     return self._config_post(url.path)
@@ -470,6 +498,45 @@ def make_server(host: str, port: int, db_path: str, miners: dict[str, Miner],
             if not isinstance(body, dict):
                 raise ValueError("expected a JSON object")
             return body
+
+        # --- power maintenance ---------------------------------------------
+
+        def _maintenance_post(self, path: str):
+            mpath = fleet.maintenance_path
+            if mpath is None:
+                return self._json(404, {"error": "maintenance control is not available"})
+            refusal = self._refuse_write()
+            if refusal:
+                return self._json(403, {"error": refusal})
+            try:
+                body = self._read_body()
+            except (ValueError, TypeError) as exc:
+                return self._json(400, {"error": f"bad request: {exc}"})
+            who = f"dashboard ({self.client_address[0]})"
+            try:
+                if path == "/api/maintenance/start":
+                    minutes = body.get("minutes")
+                    duration = None
+                    if minutes not in (None, "", 0, "0"):
+                        duration = timedelta(minutes=float(minutes))
+                    window = maint.start_manual(
+                        mpath, miners=miners,
+                        groups=[str(g) for g in body.get("groups") or []],
+                        miner_ids=[str(m) for m in body.get("miners") or []],
+                        duration=duration, name=str(body.get("name") or ""),
+                        reason=str(body.get("reason") or ""), started_by=who,
+                    )
+                    logger.info("maintenance: [%s] %s started by %s (%s, %s)", window.id,
+                                window.name, who, window.scope_text(), window.when_text())
+                    return self._json(200, {"ok": True,
+                                            "window": window.to_public(datetime.now(timezone.utc))})
+                window_id = body.get("id")
+                stopped = maint.stop_manual(mpath, str(window_id) if window_id else None)
+                for w in stopped:
+                    logger.info("maintenance: [%s] %s ended by %s", w.id, w.name, who)
+                return self._json(200, {"ok": True, "stopped": [w.id for w in stopped]})
+            except (ValueError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
 
         # --- miners.yaml editor ---------------------------------------------
 
@@ -570,8 +637,9 @@ class _closing:
 
 def serve(host: str, port: int, db_path: str, miners: dict[str, Miner],
           poll_interval: int, alerts_path: str | None = None,
-          allow_remote_settings: bool = False, config_path: str | None = None) -> int:
-    fleet = FleetState(miners)
+          allow_remote_settings: bool = False, config_path: str | None = None,
+          maintenance_path: str | None = None) -> int:
+    fleet = FleetState(miners, maintenance_path)
     # Read the history once before listening, so the first page load is not
     # the one that waits for it - and so a slow or unreadable database shows
     # up here, in the console, rather than as a page stuck on "loading".
@@ -645,6 +713,18 @@ main { padding: 0 20px 24px; max-width: 1200px; }
 .banner { border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
 .banner.bad { background: var(--badbg); color: var(--bad); }
 .banner.warn { background: var(--warnbg); color: var(--warn); }
+.banner.info { background: var(--infobg); color: var(--info); }
+.banner .btn { margin-left: 8px; padding: 2px 10px; }
+.maint { background: var(--infobg); color: var(--info); }
+#maint { margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+#maint h2 { font-size: 16px; margin: 0 0 4px; }
+#maint h3 { font-size: 13px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+#maint table { min-width: 0; }
+#maint td { white-space: normal; vertical-align: top; }
+#maint tbody tr { cursor: default; }
+#maint tbody tr:hover { background: none; }
+#mminers label { display: inline-block; margin: 2px 12px 2px 0; color: var(--text); }
+#mmsg.ok { color: var(--ok); } #mmsg.bad { color: var(--bad); }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 12px 0; }
 .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 .tile .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -712,10 +792,37 @@ header .spacer { flex: 1; }
   <span class="muted" id="updated">loading…</span>
   <span class="muted">refreshes every 15s</span>
   <span class="spacer"></span>
+  <button id="maintBtn" hidden>Maintenance</button>
   <button id="configBtn" hidden>Configuration</button>
   <button id="alertsBtn" hidden>Email alerts</button>
 </header>
 <main>
+  <section id="maint" hidden>
+    <h2>Power maintenance</h2>
+    <div class="muted">While a window is active MinerWatch keeps reading the miners it covers, but sends
+      them no restart, sleep or wake, sets no latch and emails nothing about them. The supervisor picks up
+      a window started or ended here on its next poll; no restart is needed. Planned windows can also be
+      written into miners.yaml under <code>maintenance:</code>.</div>
+    <div id="mlist"></div>
+    <form id="mform" autocomplete="off">
+      <h3>Start a window now</h3>
+      <div class="grid">
+        <label>Covers<select name="scope" id="mscope"></select></label>
+        <label>For<select name="minutes">
+          <option value="30">30 minutes</option><option value="60">1 hour</option>
+          <option value="120" selected>2 hours</option><option value="240">4 hours</option>
+          <option value="480">8 hours</option><option value="1440">24 hours</option>
+          <option value="0">Until I end it</option></select></label>
+        <label>Name<input name="name" placeholder="PSU replacement"></label>
+        <label>Note<input name="reason" placeholder="optional"></label>
+      </div>
+      <div id="mminers" hidden style="margin-top:8px"></div>
+      <div class="actions">
+        <button class="btn primary" type="submit" id="mstart">Start maintenance</button>
+        <span id="mmsg"></span>
+      </div>
+    </form>
+  </section>
   <section id="config" hidden>
     <h2>Configuration</h2>
     <div class="muted" id="cpath"></div>
@@ -852,17 +959,31 @@ async function doRefresh() {
     clearTimeout(slow); clearTimeout(giveUp);
   }
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  lastData = data;
   const banners = [];
-  if (data.stale) {
-    banners.push(data.newest_poll
+  for (const w of data.maintenance.filter(w => w.active)) {
+    const until = w.recurring ? w.when : (w.end ? "until " + when(w.end) : "until it is ended");
+    const end = w.source === "manual" && data.maintenance_editable
+      ? `<button class="btn" data-end="${esc(w.id)}">End now</button>` : "";
+    banners.push({cls: "info", html: `<b>Power maintenance: ${esc(w.name)}</b> (${esc(w.scope)}), ${esc(until)}. ` +
+      `Nothing is sent to these miners and no alert is emailed about them.${end}`});
+  }
+  if (data.maintenance_error) banners.push({cls: "warn", html: esc(data.maintenance_error)});
+  if (data.stale && data.fleet_maintenance) {
+    banners.push({cls: "info", html: "No recent poll, which is expected while the whole fleet is in maintenance."});
+  } else if (data.stale) {
+    banners.push({cls: "warn", html: data.newest_poll
       ? `No poll recorded for ${esc(ago(data.newest_poll).replace(" ago", ""))} (expected every ${data.poll_interval}s). The supervisor may not be running.`
-      : "No poll has ever been recorded in this database. Is the supervisor running with this config?");
+      : "No poll has ever been recorded in this database. Is the supervisor running with this config?"});
   }
   const latched = data.miners.filter(m => m.latches.length);
   for (const m of latched) {
-    banners.push(`<b>${esc(m.id)}</b> is latched (${esc(m.latches.join(" + "))}) since ${esc(when(m.latched_since))}, ${esc(ago(m.latched_since))}. MinerWatch will not act on it until cleared, and clearing needs a supervisor restart.`);
+    banners.push({cls: "bad", html: `<b>${esc(m.id)}</b> is latched (${esc(m.latches.join(" + "))}) since ${esc(when(m.latched_since))}, ${esc(ago(m.latched_since))}. MinerWatch will not act on it until cleared, and clearing needs a supervisor restart.`});
   }
-  $("banners").innerHTML = banners.map(b => `<div class="banner ${data.stale && b === banners[0] ? "warn" : "bad"}">${b}</div>`).join("");
+  $("banners").innerHTML = banners.map(b => `<div class="banner ${b.cls}">${b.html}</div>`).join("");
+  for (const b of $("banners").querySelectorAll("[data-end]")) b.onclick = () => endMaintenance(b.dataset.end);
+  $("maintBtn").hidden = !(data.maintenance_editable || data.maintenance.length);
+  if (!$("maint").hidden) renderMaintenance();
 
   const ms = data.miners;
   const total = ms.reduce((a, m) => a + (m.state === "mining" && m.ghs ? m.ghs : 0), 0);
@@ -870,10 +991,12 @@ async function doRefresh() {
   const tiles = [
     ["Fleet hashrate", rate(total)],
     ["Mining", `${count(m => m.state === "mining")} / ${ms.length}`],
-    ["Not mining in window", count(m => m.state !== "mining" && m.window === "open")],
+    ["Not mining in window", count(m => m.state !== "mining" && m.window === "open" && !m.maintenance)],
     ["Asleep", count(m => m.power === "asleep")],
     ["Latched", latched.length],
   ];
+  const inMaint = count(m => m.maintenance);
+  if (inMaint) tiles.push(["In maintenance", inMaint]);
   $("tiles").innerHTML = tiles.map(([k, v]) => `<div class="tile"><div class="muted">${k}</div><div class="n">${esc(v)}</div></div>`).join("");
 
   $("rows").innerHTML = ms.map(m => `
@@ -882,7 +1005,7 @@ async function doRefresh() {
       <td>${esc(m.group || "–")}</td>
       <td>${pill(m.state, stateCls(m.state))}${m.diagnosis || m.reason ? `<div class="why">${esc(m.diagnosis || m.reason)}</div>` : ""}</td>
       <td class="num">${rate(m.ghs)}</td>
-      <td>${esc(m.window)}</td>
+      <td>${m.maintenance ? pill("maintenance", "maint") : esc(m.window)}</td>
       <td>${["asleep","unsure"].includes(m.power) ? pill(m.power, m.power) : esc(m.power)}</td>
       <td>${m.latches.length ? pill(m.latches.join(" + "), "latched") : "–"}</td>
       <td title="${esc(m.last_seen)}">${esc(ago(m.last_seen) || "never")}</td>
@@ -893,6 +1016,71 @@ async function doRefresh() {
 }
 
 function select(id) { selected = id; refresh(); }
+
+// ---- power maintenance --------------------------------------------------
+let lastData = null;
+function msay(text, ok) { $("mmsg").textContent = text; $("mmsg").className = ok ? "ok" : "bad"; }
+
+function renderMaintenance() {
+  const d = lastData;
+  if (!d) return;
+  const groups = ["active", "scheduled", "ended"];
+  const kind = (w) => w.active ? "active" : (w.recurring || !w.end || new Date(w.end) > Date.now()) ? "scheduled" : "ended";
+  const label = {active: "Active now", scheduled: "Scheduled", ended: "Ended (last 7 days)"};
+  const out = [];
+  for (const g of groups) {
+    const ws = d.maintenance.filter(w => kind(w) === g);
+    if (!ws.length) continue;
+    out.push(`<h3>${label[g]}</h3><div class="wrap"><table><thead><tr><th>Name</th><th>Covers</th><th>When</th><th>From</th><th></th></tr></thead><tbody>` +
+      ws.map(w => `<tr><td><b>${esc(w.name)}</b>${w.reason ? `<div class="why">${esc(w.reason)}</div>` : ""}</td>` +
+        `<td>${esc(w.scope)}</td><td>${esc(w.when)}</td>` +
+        `<td>${w.source === "manual" ? esc(w.started_by || "started by hand") : "miners.yaml"}</td>` +
+        `<td>${g === "active" && w.source === "manual" && d.maintenance_editable ? `<button class="btn" data-end="${esc(w.id)}">End now</button>` : ""}</td></tr>`).join("") +
+      `</tbody></table></div>`);
+  }
+  $("mlist").innerHTML = out.join("") || `<div class="muted" style="margin-top:8px">No maintenance windows.</div>`;
+  for (const b of $("mlist").querySelectorAll("[data-end]")) b.onclick = () => endMaintenance(b.dataset.end);
+  $("mform").hidden = !d.maintenance_editable;
+  const sel = $("mscope"), keep = sel.value;
+  sel.innerHTML = `<option value="fleet">Whole fleet</option>` +
+    d.groups.map(g => `<option value="group:${esc(g)}">Group ${esc(g)}</option>`).join("") +
+    `<option value="miners">Selected miners…</option>`;
+  if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+  if (!$("mminers").dataset.filled) {
+    $("mminers").innerHTML = d.miners.map(m => `<label><input type="checkbox" value="${esc(m.id)}"> ${esc(m.id)}</label>`).join("");
+    $("mminers").dataset.filled = "1";
+  }
+  $("mminers").hidden = sel.value !== "miners";
+}
+$("mscope").onchange = () => { $("mminers").hidden = $("mscope").value !== "miners"; };
+
+$("mform").onsubmit = async (e) => {
+  e.preventDefault();
+  const f = $("mform").elements, scope = f.scope.value;
+  const body = {minutes: Number(f.minutes.value), name: f.name.value, reason: f.reason.value, groups: [], miners: []};
+  if (scope.startsWith("group:")) body.groups = [scope.slice(6)];
+  if (scope === "miners") {
+    body.miners = [...$("mminers").querySelectorAll("input:checked")].map(i => i.value);
+    if (!body.miners.length) return msay("Tick at least one miner.", false);
+  }
+  try {
+    const d = await post("api/maintenance/start", body);
+    msay(`Started: ${d.window.name} (${d.window.scope}), ${d.window.when}.`, true);
+    f.name.value = f.reason.value = "";
+    refresh();
+  } catch (err) { msay(err.message, false); }
+};
+
+async function endMaintenance(id) {
+  if (!confirm("End this maintenance window now? Restarts, sleep/wake and alerts resume on the next poll.")) return;
+  try { await post("api/maintenance/stop", {id}); msay("Ended.", true); refresh(); }
+  catch (err) { if (!$("maint").hidden) msay(err.message, false); else alert(err.message); }
+}
+$("maintBtn").onclick = () => {
+  const sec = $("maint");
+  sec.hidden = !sec.hidden;
+  if (!sec.hidden) renderMaintenance();
+};
 $("hours").onchange = () => loadHistory();
 
 async function loadHistory() {

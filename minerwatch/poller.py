@@ -8,6 +8,7 @@ from threading import Event as ThreadEvent
 
 from minerwatch import api
 from minerwatch.compat import interruptible_sleep
+from minerwatch.maintenance import MAINTENANCE_ACTION, ManualWindows, active_for
 from minerwatch.models import Event, Miner, State
 from minerwatch.schedule import is_working_time
 from minerwatch.sleeper import SleepController
@@ -127,6 +128,7 @@ class Poller:
         stop_event: ThreadEvent,
         dry_run: bool = True,
         sleep_dry_run: bool | None = None,
+        maintenance_path: str | None = None,
     ):
         """
         Args:
@@ -136,6 +138,8 @@ class Poller:
             dry_run: watchdog rehearsal mode (no restarts are sent).
             sleep_dry_run: overrides each miner's configured ``sleep.dry_run``.
                 ``None`` (the default) honours the config file.
+            maintenance_path: the hand-started maintenance file, re-read
+                whenever it changes. Windows from the config are always used.
         """
         self.poll_interval, _, self.default_tz, self.miners = config
         self.conn = conn
@@ -146,6 +150,10 @@ class Poller:
             conn, dry_run=dry_run, miners=self.miners, poll_interval=self.poll_interval
         )
         self.sleeper = SleepController(conn, self.miners, dry_run=sleep_dry_run)
+        self.manual_maintenance = ManualWindows(maintenance_path)
+        #: Name of the window each miner was last seen in, so entering and
+        #: leaving maintenance is logged once rather than every poll.
+        self._in_maintenance: dict[str, str] = {}
         #: Last state logged per miner, so a transition is announced once
         #: rather than every poll. Seeded from the database so a service
         #: restart does not re-announce the whole fleet.
@@ -186,17 +194,24 @@ class Poller:
         now = datetime.now(timezone.utc)
         ts = now.isoformat()
         working = is_working_time(miner, now)
+        window = active_for(miner, now, self.manual_maintenance.get())
 
         if state == State.MINING:
             action = "none"
+        elif window is not None:
+            action = MAINTENANCE_ACTION
         elif state == State.STOPPED:
             action = "alert" if working else "expected_off"
         else:
             action = "alert"
 
+        if action == MAINTENANCE_ACTION:
+            note = f"maintenance '{window.name}'"
+            reason = f"{note}: {reason}" if reason else note
         event = Event(ts=ts, miner=miner.id, state=state.value, action=action,
                       reason=reason or None, ghs=ghs)
         record_event(self.conn, event)
+        self._announce_maintenance(miner, window)
 
         # Announce state changes at INFO. Without this the log records only
         # startup lines and power actions, so a miner going unreachable - the
@@ -213,6 +228,13 @@ class Poller:
                 miner.id, previous or "unknown", state.value, rate, detail,
             )
 
+        # Power maintenance: the reading is recorded above, but neither
+        # controller sees it. Every miner on the supply is expected to stop and
+        # vanish, and acting on that is what latched ten miners together on
+        # 12 Oct 2026 - restarts cannot bring back power.
+        if window is not None:
+            return
+
         # Software power control runs first: a miner MinerWatch deliberately
         # put to sleep reads back as STOPPED, which is exactly what would make
         # the watchdog fire a restart. When the sleeper owns the current state,
@@ -223,3 +245,18 @@ class Poller:
         logger.debug(
             "Miner %s: state=%s action=%s power_handled=%s", miner.id, state.value, action, handled
         )
+
+    def _announce_maintenance(self, miner: Miner, window) -> None:
+        previous = self._in_maintenance.get(miner.id)
+        current = window.name if window is not None else None
+        if previous == current:
+            return
+        if current is None:
+            self._in_maintenance.pop(miner.id, None)
+            logger.info("%s: maintenance '%s' over - monitoring resumed", miner.id, previous)
+        else:
+            self._in_maintenance[miner.id] = current
+            logger.info(
+                "%s: in maintenance '%s' (%s) - no sleep, wake, restart or alert until it ends",
+                miner.id, current, window.when_text(),
+            )

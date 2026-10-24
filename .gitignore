@@ -45,5 +45,6 @@ logs/
 
 # Written by `minerwatch web`
 /alerts.json
+/maintenance.json
 /alerts.state.json
 /config-backups/

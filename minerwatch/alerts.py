@@ -139,7 +139,9 @@ class Condition:
 def evaluate(snap: dict, settings: AlertSettings, conn, now: datetime) -> dict[str, Condition]:
     """Every alert-worthy condition true right now, keyed for de-duplication."""
     active: dict[str, Condition] = {}
-    if settings.on_supervisor_stale and snap["stale"]:
+    # Power maintenance covering every miner may take the supervisor's PC down
+    # with it, so silence is expected then too.
+    if settings.on_supervisor_stale and snap["stale"] and not snap.get("fleet_maintenance"):
         age = snap["poll_age_seconds"]
         detail = (f"No poll has been recorded for {age / 60:.0f} minutes "
                   f"(expected every {snap['poll_interval']}s)." if age is not None
@@ -155,6 +157,10 @@ def evaluate(snap: dict, settings: AlertSettings, conn, now: datetime) -> dict[s
         return active
 
     for m in snap["miners"]:
+        if m.get("maintenance"):
+            # Everything about a miner in power maintenance is expected; see
+            # minerwatch.maintenance. Its alerts resume when the window ends.
+            continue
         if settings.on_latched and m["latches"]:
             active[f"latched:{m['id']}"] = Condition(
                 f"latched:{m['id']}", f"{m['id']} is latched ({' + '.join(m['latches'])})",
@@ -179,6 +185,15 @@ def evaluate(snap: dict, settings: AlertSettings, conn, now: datetime) -> dict[s
                 f"{minutes} minutes." + (f" Reason: {why}" if why else ""),
             )
     return active
+
+
+def _paused_keys(snap: dict) -> set[str]:
+    """Alert keys not evaluated this check because their miner is in maintenance."""
+    paused = {"stale"} if snap.get("fleet_maintenance") else set()
+    for m in snap["miners"]:
+        if m.get("maintenance"):
+            paused |= {f"{kind}:{m['id']}" for kind in ("latched", "unsure", "down")}
+    return paused
 
 
 def _utc(ts: str | None) -> str:
@@ -304,12 +319,15 @@ class AlertMonitor:
                 elif settings.repeat_hours and now - datetime.fromisoformat(
                         sent["last_sent"]) >= timedelta(hours=settings.repeat_hours):
                     reminders.append(cond)
+            paused = _paused_keys(snap)
             for key, sent in self._sent.items():
                 # While the supervisor is stale every per-miner condition drops
                 # out of `active` because it is not evaluated, not because it
                 # cleared. Reporting those as resolved would be a false all-clear
-                # at exactly the moment nothing is being watched.
-                if key not in active and "stale" not in active:
+                # at exactly the moment nothing is being watched. The same goes
+                # for a miner in maintenance: it is not evaluated, so whatever
+                # was wrong with it before is still unknown.
+                if key not in active and "stale" not in active and key not in paused:
                     resolved.append((key, sent))
             if not (new or reminders or (resolved and settings.send_resolved)):
                 for key, _ in resolved:
