@@ -247,7 +247,9 @@ python -m minerwatch -c miners.yaml clear-attention <miner|all>
 ```
 
 This releases both the watchdog and sleep latches and restores the retry
-budget. The restore is applied against that miner's own `max_restarts`;
+budget. A running supervisor picks the clear up on its next poll (it logs
+`attention latch cleared`), so there is no need to stop and start the
+scheduled task. The restore is applied against that miner's own `max_restarts`;
 trimming against a different value made clearing a no-op for any miner
 configured below the default, leaving restarts off permanently with nothing in
 the CLI to show it.

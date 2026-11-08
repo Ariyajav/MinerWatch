@@ -26,8 +26,8 @@ Windows come from two places:
     rest of that file.
 ``maintenance.json`` beside ``miners.yaml``
     Started and stopped by hand from ``minerwatch maintenance`` or the
-    dashboard. The supervisor re-reads this file whenever it changes, so unlike
-    ``clear-attention`` it takes effect on the next poll without a restart.
+    dashboard. The supervisor re-reads this file whenever it changes, so it
+    takes effect on the next poll without a restart.
 
 Either kind covers the whole fleet, or only the ``groups`` (farms) and
 ``miners`` it names.

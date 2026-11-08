@@ -193,7 +193,9 @@ python -m minerwatch -c miners.yaml clear-attention <miner|all>
 ```
 
 This releases both the watchdog and sleep latches and restores the retry
-budget. **Diagnose before clearing** — clearing without knowing why a miner
+budget. A running supervisor picks the clear up on its next poll (it logs
+`attention latch cleared`), so there is no need to stop and start the
+scheduled task. **Diagnose before clearing** — clearing without knowing why a miner
 stopped just means re-latching an hour later. See
 [watchdog.md](watchdog.md#the-latch-seen-in-anger) for what a fleet-wide latch
 looks like and why it is usually correct.

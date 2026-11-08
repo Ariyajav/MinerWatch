@@ -100,6 +100,16 @@ python3.12 -m venv .venv
 .venv/bin/python -m minerwatch -c miners.yaml run
 ```
 
+To start it at boot with systemd (Ubuntu and similar), install it as a service.
+This also installs the dashboard as a second service; both run as the folder's
+owner, not root:
+
+```bash
+sudo scripts/install-systemd.sh                     # rehearse: nothing reaches a miner
+sudo scripts/install-systemd.sh --mode live-sleep   # real sleep/wake, rehearsed restarts
+sudo scripts/install-systemd.sh --uninstall
+```
+
 > **Paths differ by platform.** The interpreter is `.venv\Scripts\python.exe`
 > on Windows and `.venv/bin/python` elsewhere. Every command below is shown in
 > the POSIX form; substitute accordingly.

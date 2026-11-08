@@ -978,7 +978,7 @@ async function doRefresh() {
   }
   const latched = data.miners.filter(m => m.latches.length);
   for (const m of latched) {
-    banners.push({cls: "bad", html: `<b>${esc(m.id)}</b> is latched (${esc(m.latches.join(" + "))}) since ${esc(when(m.latched_since))}, ${esc(ago(m.latched_since))}. MinerWatch will not act on it until cleared, and clearing needs a supervisor restart.`});
+    banners.push({cls: "bad", html: `<b>${esc(m.id)}</b> is latched (${esc(m.latches.join(" + "))}) since ${esc(when(m.latched_since))}, ${esc(ago(m.latched_since))}. MinerWatch will not act on it until cleared with <code>clear-attention</code>, which the supervisor picks up on its next poll.`});
   }
   $("banners").innerHTML = banners.map(b => `<div class="banner ${b.cls}">${b.html}</div>`).join("");
   for (const b of $("banners").querySelectorAll("[data-end]")) b.onclick = () => endMaintenance(b.dataset.end);

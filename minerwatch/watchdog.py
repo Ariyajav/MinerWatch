@@ -9,8 +9,10 @@ from minerwatch.models import Event, Miner, RecoverWith, SleepBackend, State, Wa
 from minerwatch.store import (
     ClockRules,
     clear_needs_attention,
+    events_since,
     failure_clock_start,
     is_needs_attention,
+    latest_event_id,
     record_event,
 )
 
@@ -151,6 +153,10 @@ class Watchdog:
         self._asleep_logged: set[str] = set()
         self._hydrate_needs_attention()
         self._hydrate_attempts()
+        #: Newest ``attention_cleared`` already accounted for. Hydration above
+        #: has applied every clear up to here; :meth:`pick_up_clears` applies
+        #: the ones written after it, by the CLI or any other process.
+        self._clears_seen = latest_event_id(conn, "attention_cleared")
 
     # ------------------------------------------------------------------
     # Startup hydration
@@ -588,6 +594,34 @@ class Watchdog:
         recent ones.  The cooldown timer is preserved because the last (most recent)
         entry is retained.
         """
+        self._release(miner_id)
+        clear_needs_attention(self.conn, miner_id)
+
+    def pick_up_clears(self) -> list[str]:
+        """Apply ``attention_cleared`` events written since the last call.
+
+        ``clear-attention`` runs in its own process and can only write the
+        event; until this existed the running supervisor kept its in-memory
+        latch until it was restarted. The poller calls this once per cycle,
+        so a clear takes effect on the next poll. Returns the miners released.
+
+        A clear is applied only while it is still the miner's latest latch
+        event: if the miner latched again after it, that newer latch stands.
+        """
+        released: list[str] = []
+        for event_id, miner_id in events_since(self.conn, self._clears_seen, "attention_cleared"):
+            self._clears_seen = max(self._clears_seen, event_id)
+            if is_needs_attention(self.conn, miner_id):
+                continue
+            if miner_id in self._needs_attention or miner_id in self._rehearsed_attention:
+                logger.warning("%s: attention latch cleared - watchdog restarts re-enabled", miner_id)
+            self._release(miner_id)
+            if miner_id not in released:
+                released.append(miner_id)
+        return released
+
+    def _release(self, miner_id: str) -> None:
+        """The in-memory half of a clear; :meth:`clear_attention` also records it."""
         self._needs_attention.discard(miner_id)
         self._rehearsed_attention.discard(miner_id)
         # Drop any cached power-mode reading too: an operator clearing a latch
@@ -595,7 +629,6 @@ class Watchdog:
         # would suppress the restart they just re-enabled.
         self._asleep_probe.pop(miner_id, None)
         self._asleep_logged.discard(miner_id)
-        clear_needs_attention(self.conn, miner_id)
         if miner_id in self._attempts:
             self._trim_after_clear(self._attempts[miner_id], self._resolve_by_id(miner_id).max_restarts)
 
