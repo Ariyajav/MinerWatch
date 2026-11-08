@@ -27,7 +27,13 @@ from datetime import datetime, timezone
 
 from minerwatch.backends import SleepBackendDriver, get_backend
 from minerwatch.models import Event, Miner, State
-from minerwatch.store import last_action_in, miners_with_actions, record_event
+from minerwatch.store import (
+    events_since,
+    last_action_in,
+    latest_event_id,
+    miners_with_actions,
+    record_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +105,9 @@ class SleepController:
         #: miners latched off after repeated failures
         self._attention: set[str] = set()
         self._hydrate(miners or {})
+        #: Newest ``sleep_attention_cleared`` already accounted for; see
+        #: :meth:`pick_up_clears`.
+        self._clears_seen = latest_event_id(conn, CLEARED_ACTION)
 
     # ------------------------------------------------------------------
     # Startup hydration
@@ -192,13 +201,37 @@ class SleepController:
 
     def clear_attention(self, miner_id: str) -> None:
         """Release the failure latch so automatic control resumes."""
+        self._release(miner_id)
+        self._record(miner_id, State.UNREACHABLE, CLEARED_ACTION, "manual clear")
+
+    def pick_up_clears(self) -> list[str]:
+        """Apply ``sleep_attention_cleared`` events written since the last call.
+
+        The counterpart of :meth:`Watchdog.pick_up_clears`: lets
+        ``clear-attention`` reach a running supervisor without a restart. A
+        clear is skipped when the miner latched again after it.
+        """
+        released: list[str] = []
+        for event_id, miner_id in events_since(self.conn, self._clears_seen, CLEARED_ACTION):
+            self._clears_seen = max(self._clears_seen, event_id)
+            latest = last_action_in(self.conn, miner_id, ATTENTION_ACTIONS)
+            if latest is not None and latest.action != CLEARED_ACTION:
+                continue
+            if miner_id in self._attention:
+                logger.warning("%s: sleep attention latch cleared - sleep control resumed", miner_id)
+            self._release(miner_id)
+            if miner_id not in released:
+                released.append(miner_id)
+        return released
+
+    def _release(self, miner_id: str) -> None:
+        """The in-memory half of a clear; :meth:`clear_attention` also records it."""
         self._attention.discard(miner_id)
         self._failures.pop(miner_id, None)
         self._ineffective.pop(miner_id, None)
         self._uncertain.pop(miner_id, None)
         self._last_attempt.pop(miner_id, None)
         self._cooldown_logged.pop(miner_id, None)
-        self._record(miner_id, State.UNREACHABLE, CLEARED_ACTION, "manual clear")
 
     # ------------------------------------------------------------------
     # Main decision funnel

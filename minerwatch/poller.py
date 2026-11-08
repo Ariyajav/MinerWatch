@@ -166,6 +166,7 @@ class Poller:
     async def run(self):
         while not self.stop_event.is_set():
             start = time.monotonic()
+            self._pick_up_clears()
             tasks = [self._poll_one(m) for m in self.miners.values()]
             # return_exceptions: one miner raising must not cancel the sibling
             # polls or break out of the supervision loop.
@@ -183,6 +184,19 @@ class Poller:
                 # Ctrl+C, which on Windows is compounded by the Proactor loop
                 # not observing SIGINT until it returns from a wait.
                 await interruptible_sleep(sleep, self.stop_event)
+
+    def _pick_up_clears(self) -> None:
+        """Apply ``clear-attention`` runs from other processes before this cycle.
+
+        Without it a clear only reached the supervisor through a restart. A
+        failure here is logged and the cycle goes ahead: a database hiccup must
+        not stop the fleet being polled.
+        """
+        for controller in (self.watchdog, self.sleeper):
+            try:
+                controller.pick_up_clears()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Could not read attention clears from the database")
 
     async def _poll_one(self, miner: Miner):
         try:
