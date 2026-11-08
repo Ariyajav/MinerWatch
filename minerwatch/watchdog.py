@@ -400,9 +400,12 @@ class Watchdog:
         #    Placed after the cooldown and rate limits so this HTTP read costs
         #    one request per real restart attempt rather than one per poll, and
         #    before the dry-run branch so a rehearsal reports what a live run
-        #    would actually do. Only for a STOPPED miner: a slept Bitmain still
-        #    answers its cgminer API, so UNREACHABLE is a different fault and
-        #    asking its web UI would only add a timeout to every attempt.
+        #    would actually do. Only for a STOPPED miner. A slept Bitmain
+        #    usually still answers its cgminer API, but not always (sxp-04,
+        #    3-4 Nov 2026). An UNREACHABLE miner that MinerWatch slept is
+        #    handled by the sleeper, which wakes it over HTTP before it ever
+        #    gets here. Any other UNREACHABLE is a different fault, and asking
+        #    its web UI would only add a timeout to every attempt.
         if state == State.STOPPED and getattr(cfg, "check_power_mode", True):
             asleep, detail = await self.asleep_check(miner, now)
             if asleep:
