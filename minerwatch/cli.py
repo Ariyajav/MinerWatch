@@ -976,8 +976,8 @@ def cmd_maintenance(args, config, conn) -> int:
     """List, start or stop maintenance windows.
 
     Hand-started windows live in maintenance.json beside the config, which the
-    supervisor re-reads whenever it changes - so unlike clear-attention, these
-    reach the running process on its next poll, no restart needed.
+    supervisor re-reads whenever it changes - so these reach the running
+    process on its next poll, no restart needed.
     """
     _, _, default_tz, miners = config
     path = maint.manual_path(args.config)

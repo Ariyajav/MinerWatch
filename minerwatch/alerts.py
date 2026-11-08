@@ -165,8 +165,8 @@ def evaluate(snap: dict, settings: AlertSettings, conn, now: datetime) -> dict[s
             active[f"latched:{m['id']}"] = Condition(
                 f"latched:{m['id']}", f"{m['id']} is latched ({' + '.join(m['latches'])})",
                 f"Latched since {_utc(m['latched_since'])}. MinerWatch will take no "
-                f"further action on {m['id']} until a human clears it, and "
-                f"clear-attention only reaches the supervisor after a restart. "
+                f"further action on {m['id']} until a human clears it with "
+                f"clear-attention, which takes effect on the next poll. "
                 f"Current state: {m['state']}.",
             )
         if settings.on_sleep_unsure and m["power"] == "unsure":

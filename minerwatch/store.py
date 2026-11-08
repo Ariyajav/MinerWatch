@@ -87,6 +87,27 @@ def clear_needs_attention(conn: sqlite3.Connection, miner_id: str, now: datetime
     conn.commit()
 
 
+def latest_event_id(conn: sqlite3.Connection, action: str) -> int:
+    """Highest ``id`` of an event with *action*, or 0 when there is none."""
+    row = conn.execute("SELECT MAX(id) FROM events WHERE action = ?", (action,)).fetchone()
+    return int(row[0] or 0)
+
+
+def events_since(conn: sqlite3.Connection, last_id: int, action: str) -> list[tuple[int, str]]:
+    """``(id, miner)`` of every *action* event with an id above *last_id*, oldest first.
+
+    Ranged on the primary key, so it reads only rows written since *last_id*
+    however large the table is: the events table has no index on ``action``.
+    """
+    return [
+        (int(i), m)
+        for i, m in conn.execute(
+            "SELECT id, miner FROM events WHERE id > ? AND action = ? ORDER BY id",
+            (last_id, action),
+        ).fetchall()
+    ]
+
+
 def get_last_event(conn: sqlite3.Connection, miner_id: str, action: str) -> Event | None:
     """Get the most recent event for a miner with a specific action."""
     row = conn.execute(
