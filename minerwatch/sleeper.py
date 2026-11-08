@@ -26,7 +26,7 @@ import logging
 from datetime import datetime, timezone
 
 from minerwatch.backends import SleepBackendDriver, get_backend
-from minerwatch.models import Event, Miner, State
+from minerwatch.models import Event, Miner, SleepBackend, State
 from minerwatch.store import (
     events_since,
     last_action_in,
@@ -251,7 +251,9 @@ class SleepController:
         2. hashing while we believe it slept -> settle, or clear a stale latch
         3. failure latch set                 -> owned only while we think it is asleep
         4. inside spin-up grace after wake   -> owned
-        5. unreachable                       -> not owned
+        5. unreachable                       -> wake if we slept it (or may
+                                                have) and the wake goes over
+                                                HTTP; otherwise not owned
         6. outside window and mining         -> sleep
         7. outside window and stopped        -> owned iff we slept it
         8. inside window and stopped by us,
@@ -349,9 +351,23 @@ class SleepController:
             else:
                 self._waking.pop(miner.id, None)
 
-        # 5. We cannot tell what happened; let the watchdog apply its own
-        #    policy rather than guessing.
+        # 5. Unreachable. Usually we cannot tell what happened, so we let the
+        #    watchdog apply its own policy rather than guessing. The exception
+        #    is a miner we slept, or may have slept, whose window has opened and
+        #    whose wake goes over the web UI. A sleeping S19 XP does not always
+        #    answer on its cgminer port: sxp-04 on 3 and 4 Nov 2026 stayed
+        #    unreachable for the whole three hours after a verified sleep. The
+        #    wake was never sent, and on 4 Nov the watchdog spent three restarts
+        #    on it and latched it, losing ~4 hours. The web UI is a different
+        #    port and may well answer, so try the wake. If it fails, the usual
+        #    failure count, cooldown and latch apply.
         if state == State.UNREACHABLE:
+            if (
+                working
+                and cfg.backend is SleepBackend.BITMAIN_HTTP
+                and (miner.id in self._asleep or miner.id in self._uncertain)
+            ):
+                return await self._transition(miner, state, now, to_sleep=False)
             return False
 
         # 6/7. Outside the window.
